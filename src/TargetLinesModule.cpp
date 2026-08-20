@@ -1483,15 +1483,19 @@ void draw_all_lines() {
             continue;
         }
 
-        // Lines from a lower index bow one way and from a higher index the
-        // other, so a mutual engagement draws two arcs that frame each other
-        // instead of one hiding the other. The comparison uses the logical
-        // actor/target pair, never the draw order.
-        bool flip = line.src_index > line.dst_index;
+        // A mutual engagement separates itself. A->B and B->A have exactly
+        // opposite axes, and Rodrigues gives R(-k, t) == R(k, -t), so rotating
+        // by the *same* angle about opposite axes already swings the two arcs
+        // to opposite sides.
+        //
+        // Flipping the angle by index as well would negate that a second time
+        // and put both arcs back on the same side, which is precisely how they
+        // came to overlap. The angle is therefore constant here.
+        bool flip = false;
 
-        // A retracting arc is built from the target end. Reversing the axis
-        // would mirror the bow and make the curve jump to the other side, so
-        // the sign is flipped too and the arc stays exactly where it was.
+        // A retracting arc is built from the target end. That reverses the
+        // axis for a line that should not move, so here the sign *is* flipped
+        // to cancel it out and hold the curve exactly where it was.
         Position from = source;
         Position to = destination;
         if (line.reverse) {

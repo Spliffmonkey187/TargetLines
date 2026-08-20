@@ -214,7 +214,7 @@ ground with y up. Kept in FFXI terms everywhere and swapped once, in
 ### The arc
 
 Quadratic Bézier. Control point = midpoint raised by `distance * 0.18`
-(clamped 0.4–4.0 yalms), then **rotated about the start→end axis by ±11.25°**
+(clamped 0.4–4.0 yalms), then **rotated about the start→end axis by 11.25°**
 (Ashita's π/16, Rodrigues rotation). The sideways rotation is what stops two
 entities targeting each other from drawing one line on top of the other.
 
@@ -222,10 +222,42 @@ entities targeting each other from drawing one line on top of the other.
 points and evaluates in screen space. Ashita's way is cheaper but cannot carry
 per-vertex depth.
 
-**Reversal gotcha:** a retracting arc is drawn from the target end. Reversing the
-axis mirrors the bow and makes the curve visibly jump sides. So the DLL takes a
-`reverse` flag rather than having Lua swap endpoints, and flips the bow sign to
-compensate.
+#### The Rodrigues sign trap
+
+**Read this before touching the bow, or before adding any other geometry that
+rotates about an axis derived from two endpoints.**
+
+Rodrigues rotation satisfies:
+
+```
+R(-k, -t) == R(k, t)
+```
+
+Negating the axis *and* the angle is a no-op. This matters because A→B and B→A
+produce exactly opposite axes, and it cuts both ways:
+
+- **Two different lines (A→B and B→A) separate on their own.** Their axes are
+  already opposite, so rotating by the *same* angle swings them to opposite
+  sides. Flipping the angle by index as well negates a second time and puts them
+  back on the same side. This shipped as a bug: the incoming and outgoing arcs
+  of a fight sat on top of each other.
+
+- **One line drawn backwards must flip the angle.** A retracting arc is built
+  from the target end, which reverses the axis for a curve that should not move,
+  so the sign *is* flipped to cancel it out. This is why the DLL takes a
+  `reverse` flag rather than having Lua swap the endpoints.
+
+Worked example, A at origin and B ten yalms east, control point raised 2:
+
+| | control north |
+|---|---|
+| A→B, angle `t` | −2·sin t |
+| B→A, angle `t` | **+2·sin t** — opposite, correct |
+| B→A, angle `−t` | −2·sin t — identical to A→B, the bug |
+
+The bug was invisible at first because a growing arc and a retracting one differ
+by the `reverse` flip, so a fight looked correct until both lines settled into
+the same phase and collapsed onto each other.
 
 ### Textures
 
@@ -279,6 +311,32 @@ Three animation phases:
 - **expiring** — withdraws into the target over the last 0.5s
 
 Only growing arcs get the travelling orb.
+
+### Auto-attack modes
+
+Auto-attacks land every few seconds for a whole fight and are most of the
+on-screen clutter, so `//tlines attacks` controls them. Categories **1 (melee)
+and 2 (ranged)** are "regular"; everything else — weapon skills, spells, job
+abilities, monster TP moves, pet abilities — always draws and is never
+suppressed.
+
+| mode | behaviour |
+|---|---|
+| `first` (default) | one full animation per engagement, then quiet |
+| `repeat` | the animation replays on each attack, 3s cooldown |
+| `off` | abilities and spells only |
+
+`repeat` works by resetting **both** `clock` and `first_clock`, so the arc runs
+its whole grow-hold-fade cycle again and pulses with the swing rhythm.
+
+The first attempt instead disabled Ashita's 2.5s retract to keep the line up
+permanently. That was wrong: it turned the arc into a static beam and removed
+the fade that follows the orb in, which is a large part of what makes the effect
+read as motion. **Persistence should mean "recurs", not "never goes away".**
+
+Suppression is keyed `"actor>target"` and cleared when the arc expires, so
+re-pulling the same mob draws a fresh line rather than staying silent for the
+session. It is also cleared on a zone and whenever the mode changes.
 
 **Uncertain:** pet/trust detection. Ashita reads spawn flag `0x100`; Windower
 doesn't expose that bit, so we use `charmed` and `pet_owner_id`. A trust or
@@ -361,8 +419,8 @@ live entity positions, self-scaling model anchoring, depth-occluded rendering,
 world-space Bézier arc with sideways bow, packet-driven combat tracking with
 four colours and three animation phases, procedural glow texture, travelling orb.
 
-**Untested at time of writing:** the textured beam and orb (built and installed,
-not yet seen in game).
+Confirmed in game: the textured beam and orb, the three auto-attack modes, and
+mutual engagements bowing to opposite sides.
 
 **Open questions:**
 - Is a 13-bone cutoff right for all skeletons? Percentile fallback if not.
@@ -388,6 +446,29 @@ not yet seen in game).
 **MogSafe's TargetLines** (`../MogSafe/`) is a separate, more feature-complete
 implementation — but a **Windower plugin** (`PluginBase`, DLL in `plugins/`),
 drawing in `PostRender` with `ZENABLE FALSE`, so it's a flat overlay with no
-depth and will break on Windower updates. It does *not* patch `draw_scene`, so it
-won't fight SceneHook and can run side by side for comparison. ~3,400 lines,
-worth mining for packet-handling detail.
+depth and will break on Windower updates. Its Lua also **writes a JSON state
+file to disk** which the plugin reads back — the workaround the Windower devs
+criticised. We call straight from Lua into the DLL instead.
+
+It does *not* patch `draw_scene`, so it won't fight SceneHook and can run side
+by side for comparison. ~3,400 lines of Lua plus ~3,400 of C++.
+
+**Take its logic, not its plumbing.** Ideas worth having, in rough order of
+value:
+
+1. **Auto-attack modes** — done, see §7.
+2. **AoE indicators.** When an action names several targets, measure the
+   distance to the *furthest* one and use that as the radius. This infers real
+   spell extent from packet data with no table of spell radii to maintain.
+   Visually: a large ring expanding from the caster plus a **small ring on each
+   entity actually hit**, which shows who was caught rather than just how far it
+   reached. Confirmed against Protectra (green, from a player) and Bomb Toss
+   (red, from a goblin). They also handle spells centred on the caster rather
+   than the target (`caster_centered_elemental_ra`, `aoe_center_overrides`).
+3. **Role filtering** — player / party+trust / pet / enemy / other-party /
+   abilities, each independently toggleable with its own opacity. Finer than our
+   single all/alliance/party filter.
+4. **Settings UI** — a `texts` object plus a `mouse` event handler. Pure Lua, no
+   plugin involvement, so it ports directly. Their `config_rows` table driving
+   toggles and choice-lists is a good model.
+5. **Colour blind mode**, and their width/opacity scale presets.

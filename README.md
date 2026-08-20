@@ -76,6 +76,7 @@ Nothing goes in the `plugins` folder and there is nothing to configure.
 
 ```
 //tlines filter <mode>            all | alliance | party          (default all)
+//tlines attacks <mode>           first | repeat | off            (default first)
 //tlines target                   toggle the always-on line to your target
 ```
 
@@ -133,7 +134,13 @@ retract the lines involved early.
 An action naming several targets fans out an arc to each.
 
 Two entities targeting each other bow their arcs opposite ways, so the pair form
-a lens rather than one hiding the other.
+a lens rather than one hiding the other. `//tlines bow` widens or narrows the
+separation.
+
+Auto-attacks land every few seconds for a whole fight, so `//tlines attacks`
+controls how much of that is drawn. `first` gives one animation per engagement,
+`repeat` replays it with each swing, `off` shows abilities and spells only.
+Weapon skills, spells, job abilities and monster TP moves always draw.
 
 ## Where lines attach
 

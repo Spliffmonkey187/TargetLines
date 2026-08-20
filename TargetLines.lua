@@ -150,6 +150,12 @@ local function phase(arc, now)
     local age = now - arc.clock
     local held = arc.first_clock and (now - arc.first_clock)
 
+    -- Ashita retires a player line 2.5s after it first appeared, retracting it
+    -- over the following half second. This always applies: it is the fade that
+    -- follows the orb in, and losing it makes the line a static beam.
+    --
+    -- Persistence in repeat mode comes from the tracker replaying the arc on
+    -- each attack instead, so the line pulses with the swing rhythm.
     if arc.colour == 'player' and held and held > 2.5 then
         return math.max((3 - held) * 2, 0), true
     end
@@ -207,6 +213,19 @@ windower.register_event('addon command', function(command, ...)
     elseif command == 'target' then
         show_target = not show_target
         chat('line to current target: ' .. (show_target and 'on' or 'off'))
+    elseif command == 'attacks' then
+        local want = args[1] and args[1]:lower()
+        if want == 'persistent' then
+            want = 'repeat'
+        end
+
+        local mode = tracker.mode(want)
+        local described = {
+            first = 'one line per engagement',
+            ['repeat'] = 'persistent while the attacks keep coming',
+            off = 'no auto-attack lines, abilities and spells only',
+        }
+        chat(('auto-attacks: %s - %s'):format(mode, described[mode]))
     elseif command == 'arc' then
         chat(_TargetLines.arc())
     elseif command == 'reset' then
@@ -270,6 +289,7 @@ windower.register_event('addon command', function(command, ...)
     elseif command == 'help' then
         chat('//tlines on | off          start or stop drawing')
         chat('//tlines filter <mode>     all / alliance / party')
+        chat('//tlines attacks <mode>    first / repeat / off, for auto-attacks')
         chat('//tlines target            toggle the line to your current target')
         chat('//tlines arc               toggle curved arc vs straight line')
         chat('//tlines arch <0-2>        arc rise as a fraction of the distance')
@@ -286,8 +306,8 @@ windower.register_event('addon command', function(command, ...)
         chat('any setting also takes "default", e.g. //tlines chest default')
     else
         chat(_TargetLines.status())
-        chat(('filter %s, target line %s, %d arc(s) tracked')
-            :format(filter, show_target and 'on' or 'off', (function()
+        chat(('filter %s, auto-attacks %s, target line %s, %d arc(s) tracked')
+            :format(filter, tracker.mode(), show_target and 'on' or 'off', (function()
                 local n = 0
                 for _ in pairs(arcs) do n = n + 1 end
                 return n
@@ -320,6 +340,9 @@ windower.register_event('prerender', function()
     for src_index, arc in pairs(arcs) do
         if now - arc.clock > TIMEOUTS[arc.colour] then
             arcs[src_index] = nil
+            -- The engagement is over, so let a fresh one draw again rather
+            -- than staying suppressed for the rest of the session.
+            tracker.forget(src_index)
         elseif not wanted or wanted[src_index] or wanted[arc.dst] then
             local progress, reverse = phase(arc, now)
             if progress > 0 then

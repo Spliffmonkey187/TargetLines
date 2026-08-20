@@ -15,6 +15,29 @@ local packets = require('packets')
 
 local arcs = {}
 
+-- Regular attacks: melee and ranged auto-attacks. Everything else -- weapon
+-- skills, spells, job abilities, monster TP moves, pet abilities -- counts as a
+-- special action and is never suppressed.
+local REGULAR_CATEGORIES = {
+    [1] = true,  -- melee attack
+    [2] = true,  -- ranged attack
+}
+
+-- How auto-attacks are drawn:
+--   first   one line when an engagement begins, then quiet until it ends.
+--           Auto-attacks land every few seconds all fight long, so redrawing
+--           on each swing is most of the on-screen clutter.
+--   repeat  refresh the line while attacks continue, so it stays up for as
+--           long as the fight does.
+--   off     no lines for auto-attacks at all; abilities and spells only.
+local attack_mode = 'first'
+
+-- When an actor last drew a regular-attack line at a given target, keyed
+-- "actor>target". In repeat mode the line is only refreshed once the cooldown
+-- has passed, so the grow animation is not restarted on every swing.
+local seen_attacks = {}
+local REPEAT_COOLDOWN = 3.0
+
 -- How long each kind of line lingers, in seconds. Combat lines outlast the
 -- friendly ones so a fight stays readable between rounds.
 local TIMEOUTS = {
@@ -86,6 +109,41 @@ local function classify(actor, target)
     return is_mob(target) and 'player' or 'player_friendly'
 end
 
+-- Whether a regular attack from this actor onto this target should draw.
+-- Special actions always draw and never touch the bookkeeping.
+local function allow_regular(regular, actor_index, target_index, now)
+    if not regular then
+        return true
+    end
+
+    local key = actor_index .. '>' .. target_index
+
+    if attack_mode == 'first' then
+        if seen_attacks[key] then
+            return false
+        end
+    elseif attack_mode == 'repeat' then
+        local last = seen_attacks[key]
+        if last and now - last < REPEAT_COOLDOWN then
+            return false
+        end
+    end
+
+    seen_attacks[key] = now
+    return true
+end
+
+-- Called when an arc expires, so the next engagement with the same target
+-- draws again rather than staying suppressed for the rest of the session.
+local function forget(actor_index)
+    local prefix = actor_index .. '>'
+    for key in pairs(seen_attacks) do
+        if key:sub(1, #prefix) == prefix then
+            seen_attacks[key] = nil
+        end
+    end
+end
+
 local function handle_action(data)
     local packet = packets.parse('incoming', data)
     if not packet then
@@ -104,12 +162,18 @@ local function handle_action(data)
 
     local category = tonumber(packet['Category']) or 0
     local now = os.clock()
+    local regular = REGULAR_CATEGORIES[category] or false
+
+    if regular and attack_mode == 'off' then
+        return
+    end
 
     -- An action can name several targets; each one gets its own arc, so an AoE
     -- fans out the way it does in FFXII.
     for i = 1, count do
         local target = mob_by_id(packet[('Target %u ID'):format(i)])
-        if target and target.index and target.index ~= actor.index then
+        if target and target.index and target.index ~= actor.index
+            and allow_regular(regular, actor.index, target.index, now) then
             local colour = classify(actor, target)
             local clock = now
             local first_clock = now
@@ -120,6 +184,14 @@ local function handle_action(data)
                     -- Category 4 is a completed spell. Friendly casts expire
                     -- almost at once so a cure flashes rather than lingering.
                     clock = now - TIMEOUTS.player_friendly + 0.5
+                elseif regular and attack_mode == 'repeat' then
+                    -- Deliberately keep both clocks at `now`, so the arc runs
+                    -- its whole grow-hold-fade cycle again. That is what makes
+                    -- repeat mode persistent: the line keeps coming back with
+                    -- the swing rhythm, rather than sitting there as a static
+                    -- beam with no animation.
+                    clock = now
+                    first_clock = now
                 elseif existing.dst == target.index
                     and now - existing.clock < TIMEOUTS[colour] then
                     -- Still hitting the same target: keep the original start so
@@ -184,9 +256,27 @@ windower.register_event('zone change', function()
     for index in pairs(arcs) do
         arcs[index] = nil
     end
+
+    for key in pairs(seen_attacks) do
+        seen_attacks[key] = nil
+    end
 end)
 
 return {
     arcs = arcs,
     timeouts = TIMEOUTS,
+    forget = forget,
+
+    mode = function(want)
+        if want == 'first' or want == 'repeat' or want == 'off' then
+            attack_mode = want
+            -- Switching mode starts clean, so a line suppressed under the old
+            -- rule is not still suppressed under the new one.
+            for key in pairs(seen_attacks) do
+                seen_attacks[key] = nil
+            end
+        end
+
+        return attack_mode
+    end,
 }
