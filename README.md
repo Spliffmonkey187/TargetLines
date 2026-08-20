@@ -239,3 +239,9 @@ design, rendering internals and the gotchas — is in
   whose depth mapping, batching and render-state discipline this follows (0BSD).
 - **Arcon** for the entity array signature in `libraries/memory/types.lua`, and
   **Rubenator** and **Darkdoom** for the nameplate-bone anchoring advice.
+
+## Licence
+
+BSD 3-Clause. See [LICENSE](LICENSE), which also records the third-party
+components and their terms — chiefly `SceneHook/`, which is Broguypal's and
+carries its own [licence](SceneHook/LICENSE).
