@@ -1,0 +1,4 @@
+* text=auto
+
+# Never line-ending-convert the built module.
+*.dll binary

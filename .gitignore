@@ -1,0 +1,15 @@
+# CMake and MSBuild output. The shipped DLL in libs/ is committed; this is the
+# intermediate tree it gets built in.
+src/build/
+
+# Visual Studio / MSBuild leftovers
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.tlog
+*.user
+
+# Windower writes addon settings here at runtime
+data/
