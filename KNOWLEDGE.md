@@ -584,6 +584,86 @@ opacity after that.
 
 ---
 
+## 10b. Stage 6 — performance (planned)
+
+Nothing here is measured yet; these are the candidates, cheapest and safest
+first. **Measure before and after** rather than trusting this ordering.
+
+### 1. Cache the device vtable pointers
+
+Almost certainly the biggest easy win, and pure overhead.
+
+Every `dev_*` wrapper calls `vtable_slot()`, and `vtable_slot()` calls
+`span_readable()` **twice** -- once for the object, once for the vtable entry --
+each of which is a `VirtualQuery`, a kernel transition. There are ~64
+render-state and texture-stage calls in `begin_draw_state` / `end_draw_state`
+alone, so a frame costs well over a hundred `VirtualQuery` calls before any
+geometry is touched.
+
+The device is acquired once and its vtable does not move. Resolve the dozen
+function pointers at acquisition, validate them once there, and call them
+directly thereafter.
+
+### 2. Precompute the ring trig
+
+`build_ring` calls `std::cos` and `std::sin` per vertex, per ring, per frame --
+49 of each per ring. The angles are fixed, so a table built once at load covers
+every full ring, exactly as TargetRing does. Comets sample a partial arc so they
+need interpolation into the same table, or their own smaller one.
+
+### 3. Reject whole objects before projecting their vertices
+
+Projection currently runs per vertex, and an arc off screen still costs 40 full
+matrix multiplies before every sample is discarded. Projecting the two endpoints
+first, and skipping the whole arc when both fail, would cut the common case of a
+busy zone with many distant fights.
+
+### 4. Scale sample counts with distance
+
+40 samples is generous for an arc a few pixels long. Choosing the count from the
+projected screen length would cut most of the vertex work in a crowd, where it
+matters most.
+
+### What Geno means by moving work to the GPU
+
+He did not explain it in the Discord, so this is inference -- but there is only
+really one thing it can mean here.
+
+We use `D3DFVF_XYZRHW`: **pre-transformed** vertices. The CPU does the whole
+world to clip to screen transform for every vertex of every arc and ring, every
+frame, and hands the GPU finished screen coordinates. The GPU only rasterises.
+
+The alternative is `D3DFVF_XYZ` -- untransformed vertices with the world, view
+and projection matrices set on the device, so the **GPU** does the transform in
+its fixed-function pipeline. Two gains follow:
+
+1. The per-vertex matrix maths leaves the CPU entirely.
+2. Geometry whose *shape* does not change can live in a static vertex buffer
+   created once and positioned by a world matrix per draw. A ring is the perfect
+   case: a unit circle uploaded once, then scaled and translated by a matrix.
+   The per-frame CPU cost drops to a matrix and a draw call, with no vertex data
+   crossing the bus at all.
+
+**The catch, and why this is not a drop-in change.** Ribbon width is currently
+computed in *screen space*: each sample is projected, then extruded
+perpendicular to the screen-space path by a pixel count. That is what makes a
+line the same thickness near and far. Fixed-function GPU transform cannot do
+that -- thickness would have to be in yalms, so lines would thin with distance.
+Arguably more correct in 3D, but a visible change from Ashita.
+
+D3D8 does have vertex shaders (1.1) which could do screen-space width on the
+GPU, but that raises compatibility questions under DXVK and dgVoodoo, which many
+players run.
+
+**A sensible split:** move *rings* to GPU-transformed static geometry first, as
+a circle is fixed geometry and world-space thickness looks fine on a ground
+ring. Keep arcs on the CPU path where screen-space width matters. That captures
+most of the win without changing how the lines look.
+
+Worth asking Geno directly what he did before building any of it.
+
+---
+
 ## 11. Other people's work
 
 | what | who | licence | role here |

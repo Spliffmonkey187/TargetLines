@@ -283,6 +283,9 @@ MinGW works too (`-m32`), per the `else()` branch in `src/CMakeLists.txt`.
 - [x] **Stage 4** — auto-attack modes, area-of-effect sweep rings with orbiting
       comets, and role filtering
 - [x] **Stage 5** — settings model, clickable config panel, persistence
+- [ ] **Stage 6** — performance: cache the device vtable pointers, precompute
+      ring trig, reject off-screen objects before projecting them, and look
+      at moving ring geometry onto the GPU
 - [ ] per-role opacity, colour blind mode
 
 Engineering detail — verified memory offsets, the bone data behind the anchoring

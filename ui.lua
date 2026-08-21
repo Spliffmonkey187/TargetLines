@@ -35,7 +35,9 @@ local on_change = nil
 local LABEL_WIDTH = 22
 local CONTROL_WIDTH = 15
 local ROW_WIDTH = LABEL_WIDTH + CONTROL_WIDTH + 2
-local CLOSE_COLUMN = LABEL_WIDTH + 6
+-- [x] sits hard against the right edge, and is the only thing on the title
+-- row that responds, so dragging by the title cannot close the panel.
+local CLOSE_COLUMN = ROW_WIDTH - 3
 
 -- Inline colour codes, rendered by the text primitive itself. Everything after
 -- one stays tinted until the next, so each field ends by going back to white.
@@ -177,7 +179,9 @@ local function render()
     end
 
     add('', nil, false)
-    add(GREY .. '  drag to move, [x] to close', nil, false)
+    local hint = 'drag to move, [x] to close'
+    add(GREY .. (' '):rep(math.max(math.floor((ROW_WIDTH - #hint) / 2), 0))
+        .. hint, nil, false)
 
     -- box:text() sets the displayed string. Assigning box.text instead goes
     -- through the __newindex metamethod and merely defines an interpolation
@@ -276,9 +280,21 @@ local function control_at(x, y)
     -- is label, and stays free for dragging.
     local control_start = width * 0.55
 
+    local char_width = nil
+    if measured.longest and measured.longest > 0 then
+        char_width = width / measured.longest
+    end
+
     local entry = row_map[row]
     if entry == 'title' then
-        if rel >= control_start then
+        -- Deliberately tight. The title row is the natural place to grab
+        -- the panel, so anything looser closes it while you are dragging.
+        if not char_width then
+            return nil
+        end
+
+        local column = math.floor(rel / char_width)
+        if column >= CLOSE_COLUMN - 1 and column <= CLOSE_COLUMN + 3 then
             return {kind = 'close'}
         end
 
@@ -300,8 +316,7 @@ local function control_at(x, y)
     -- Precise mode matches the bracket columns exactly, so clicking the readout
     -- between them does nothing. It needs the character width to be right,
     -- which is why the forgiving split is the fallback rather than the reverse.
-    if set.ui_precise and measured.longest and measured.longest > 0 then
-        local char_width = width / measured.longest
+    if set.ui_precise and char_width then
         local column = math.floor(rel / char_width)
         local first = LABEL_WIDTH + 2
 
