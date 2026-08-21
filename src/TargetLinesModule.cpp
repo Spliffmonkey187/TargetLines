@@ -491,39 +491,74 @@ using fn_draw_up = long(__stdcall*)(void*, DWORD, unsigned, void const*, unsigne
 std::uintptr_t g_device = 0;
 void* d3d_device_ = nullptr;
 
+// The device methods, resolved once.
+//
+// Every call used to go through vtable_slot(), which runs span_readable()
+// twice -- once for the object, once for the vtable entry -- and each of those
+// is a VirtualQuery, a kernel transition. begin_draw_state and end_draw_state
+// alone make about sixty device calls, so a frame was spending well over a
+// hundred VirtualQuery calls before touching any geometry.
+//
+// The device is acquired once and its vtable does not move, so the pointers are
+// resolved and validated at acquisition and called directly thereafter.
+struct DeviceApi {
+    fn_get_transform get_transform = nullptr;
+    fn_get_viewport get_viewport = nullptr;
+    fn_get_render_state get_render_state = nullptr;
+    fn_set_render_state set_render_state = nullptr;
+    fn_get_vertex_shader get_vertex_shader = nullptr;
+    fn_set_vertex_shader set_vertex_shader = nullptr;
+    fn_get_texture get_texture = nullptr;
+    fn_set_texture set_texture = nullptr;
+    fn_get_texture_stage_state get_texture_stage_state = nullptr;
+    fn_set_texture_stage_state set_texture_stage_state = nullptr;
+    fn_draw_up draw_up = nullptr;
+};
+
+DeviceApi g_dev {};
+
+void resolve_device_api() {
+    g_dev.get_transform = reinterpret_cast<fn_get_transform>(vtable_slot(g_device, 38));
+    g_dev.get_viewport = reinterpret_cast<fn_get_viewport>(vtable_slot(g_device, 41));
+    g_dev.set_render_state = reinterpret_cast<fn_set_render_state>(vtable_slot(g_device, 50));
+    g_dev.get_render_state = reinterpret_cast<fn_get_render_state>(vtable_slot(g_device, 51));
+    g_dev.get_texture = reinterpret_cast<fn_get_texture>(vtable_slot(g_device, 60));
+    g_dev.set_texture = reinterpret_cast<fn_set_texture>(vtable_slot(g_device, 61));
+    g_dev.get_texture_stage_state = reinterpret_cast<fn_get_texture_stage_state>(
+        vtable_slot(g_device, 62));
+    g_dev.set_texture_stage_state = reinterpret_cast<fn_set_texture_stage_state>(
+        vtable_slot(g_device, 63));
+    g_dev.draw_up = reinterpret_cast<fn_draw_up>(vtable_slot(g_device, 72));
+    g_dev.set_vertex_shader = reinterpret_cast<fn_set_vertex_shader>(vtable_slot(g_device, 76));
+    g_dev.get_vertex_shader = reinterpret_cast<fn_get_vertex_shader>(vtable_slot(g_device, 77));
+}
+
 long dev_GetTransform(DWORD state, D3DMATRIX* out) {
-    auto f = reinterpret_cast<fn_get_transform>(vtable_slot(g_device, 38));
-    return f ? f(d3d_device_, state, out) : -1;
+    return g_dev.get_transform ? g_dev.get_transform(d3d_device_, state, out) : -1;
 }
 
 long dev_GetViewport(D3DVIEWPORT8* out) {
-    auto f = reinterpret_cast<fn_get_viewport>(vtable_slot(g_device, 41));
-    return f ? f(d3d_device_, out) : -1;
+    return g_dev.get_viewport ? g_dev.get_viewport(d3d_device_, out) : -1;
 }
 
 long dev_GetRenderState(DWORD state, DWORD* out) {
-    auto f = reinterpret_cast<fn_get_render_state>(vtable_slot(g_device, 51));
-    return f ? f(d3d_device_, state, out) : -1;
+    return g_dev.get_render_state ? g_dev.get_render_state(d3d_device_, state, out) : -1;
 }
 
 long dev_SetRenderState(DWORD state, DWORD value) {
-    auto f = reinterpret_cast<fn_set_render_state>(vtable_slot(g_device, 50));
-    return f ? f(d3d_device_, state, value) : -1;
+    return g_dev.set_render_state ? g_dev.set_render_state(d3d_device_, state, value) : -1;
 }
 
 long dev_GetVertexShader(DWORD* out) {
-    auto f = reinterpret_cast<fn_get_vertex_shader>(vtable_slot(g_device, 77));
-    return f ? f(d3d_device_, out) : -1;
+    return g_dev.get_vertex_shader ? g_dev.get_vertex_shader(d3d_device_, out) : -1;
 }
 
 long dev_SetVertexShader(DWORD value) {
-    auto f = reinterpret_cast<fn_set_vertex_shader>(vtable_slot(g_device, 76));
-    return f ? f(d3d_device_, value) : -1;
+    return g_dev.set_vertex_shader ? g_dev.set_vertex_shader(d3d_device_, value) : -1;
 }
 
 long dev_GetTexture(DWORD stage, void** out) {
-    auto f = reinterpret_cast<fn_get_texture>(vtable_slot(g_device, 60));
-    return f ? f(d3d_device_, stage, out) : -1;
+    return g_dev.get_texture ? g_dev.get_texture(d3d_device_, stage, out) : -1;
 }
 
 // GetTexture hands back a reference we owe. Released through slot 2 like any
@@ -541,23 +576,19 @@ void release_object(void* object) {
 }
 
 long dev_SetTexture(DWORD stage, void* texture) {
-    auto f = reinterpret_cast<fn_set_texture>(vtable_slot(g_device, 61));
-    return f ? f(d3d_device_, stage, texture) : -1;
+    return g_dev.set_texture ? g_dev.set_texture(d3d_device_, stage, texture) : -1;
 }
 
 long dev_GetTextureStageState(DWORD stage, DWORD type, DWORD* out) {
-    auto f = reinterpret_cast<fn_get_texture_stage_state>(vtable_slot(g_device, 62));
-    return f ? f(d3d_device_, stage, type, out) : -1;
+    return g_dev.get_texture_stage_state ? g_dev.get_texture_stage_state(d3d_device_, stage, type, out) : -1;
 }
 
 long dev_SetTextureStageState(DWORD stage, DWORD type, DWORD value) {
-    auto f = reinterpret_cast<fn_set_texture_stage_state>(vtable_slot(g_device, 63));
-    return f ? f(d3d_device_, stage, type, value) : -1;
+    return g_dev.set_texture_stage_state ? g_dev.set_texture_stage_state(d3d_device_, stage, type, value) : -1;
 }
 
 long dev_DrawPrimitiveUP(DWORD type, unsigned count, void const* data, unsigned stride) {
-    auto f = reinterpret_cast<fn_draw_up>(vtable_slot(g_device, 72));
-    return f ? f(d3d_device_, type, count, data, stride) : -1;
+    return g_dev.draw_up ? g_dev.draw_up(d3d_device_, type, count, data, stride) : -1;
 }
 
 using fn_create_texture = long(__stdcall*)(void*, unsigned, unsigned, unsigned,
@@ -1236,6 +1267,20 @@ int build_arc(Position const& source, Position const& destination, bool flip,
 // screen-space thickness and depth handling for free.
 // `extent` of zero or more than a full turn gives a closed ring; anything less
 // gives an arc ending at `head`, which is drawn as a comet.
+// A full ring always uses the same angles, so they are computed once. Comets
+// sample an arbitrary arc and still need real trig, but they are short.
+float g_ring_cos[kRingSegments + 1] {};
+float g_ring_sin[kRingSegments + 1] {};
+
+void build_ring_table() {
+    for (int i = 0; i <= kRingSegments; ++i) {
+        float const angle = 6.28318530718f * static_cast<float>(i)
+            / static_cast<float>(kRingSegments);
+        g_ring_cos[i] = std::cos(angle);
+        g_ring_sin[i] = std::sin(angle);
+    }
+}
+
 int build_ring(Position const& centre, float radius, float head, float extent,
     Position* out, int capacity) {
     if (radius <= 0.0f || capacity < 4) {
@@ -1259,12 +1304,25 @@ int build_ring(Position const& centre, float radius, float head, float extent,
         segments = capacity - 1;
     }
 
+    // A closed ring at full segment count is exactly the table.
+    bool const tabulated = closed && segments == kRingSegments;
+
     for (int i = 0; i <= segments; ++i) {
-        float const angle = start + span * static_cast<float>(i)
-            / static_cast<float>(segments);
+        float cosine;
+        float sine;
+        if (tabulated) {
+            cosine = g_ring_cos[i];
+            sine = g_ring_sin[i];
+        } else {
+            float const angle = start + span * static_cast<float>(i)
+                / static_cast<float>(segments);
+            cosine = std::cos(angle);
+            sine = std::sin(angle);
+        }
+
         out[i] = Position{
-            centre.east + radius * std::cos(angle),
-            centre.north + radius * std::sin(angle),
+            centre.east + radius * cosine,
+            centre.north + radius * sine,
             centre.height,
         };
     }
@@ -1813,6 +1871,7 @@ void acquire_device(std::uintptr_t renderer) {
 
         g_device = address;
         d3d_device_ = device;
+        resolve_device_api();
 
         // GetDevice added a reference; the renderer owns the device, not us.
         auto release = reinterpret_cast<fn_release>(vtable_slot(address, 2));
@@ -2435,6 +2494,8 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__TargetLines(lua_State* L) 
     if (!bind_lua()) {
         return 0;
     }
+
+    build_ring_table();
 
     g_lua.createtable(L, 0, 10);
 

@@ -589,9 +589,9 @@ opacity after that.
 Nothing here is measured yet; these are the candidates, cheapest and safest
 first. **Measure before and after** rather than trusting this ordering.
 
-### 1. Cache the device vtable pointers
+### 1. Cache the device vtable pointers — DONE
 
-Almost certainly the biggest easy win, and pure overhead.
+Was the biggest easy win, and pure overhead.
 
 Every `dev_*` wrapper calls `vtable_slot()`, and `vtable_slot()` calls
 `span_readable()` **twice** -- once for the object, once for the vtable entry --
@@ -600,16 +600,20 @@ render-state and texture-stage calls in `begin_draw_state` / `end_draw_state`
 alone, so a frame costs well over a hundred `VirtualQuery` calls before any
 geometry is touched.
 
-The device is acquired once and its vtable does not move. Resolve the dozen
-function pointers at acquisition, validate them once there, and call them
-directly thereafter.
+The device is acquired once and its vtable does not move, so the eleven hot
+pointers are now resolved in `resolve_device_api()` at acquisition and called
+directly. `CreateTexture` still goes the slow way; it runs twice, at load.
 
-### 2. Precompute the ring trig
+Not yet measured. The reasoning is sound but the size of the win is a guess
+until someone puts a timer on a frame.
+
+### 2. Precompute the ring trig — DONE
 
 `build_ring` calls `std::cos` and `std::sin` per vertex, per ring, per frame --
-49 of each per ring. The angles are fixed, so a table built once at load covers
-every full ring, exactly as TargetRing does. Comets sample a partial arc so they
-need interpolation into the same table, or their own smaller one.
+49 of each per ring. The angles are fixed, so a table built once at load now covers
+every full ring, exactly as TargetRing does. Comets sample an arbitrary arc and
+still compute real trig, but they are short -- roughly twenty segments against
+the ring's forty-eight.
 
 ### 3. Reject whole objects before projecting their vertices
 
