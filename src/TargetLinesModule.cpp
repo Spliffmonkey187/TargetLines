@@ -2120,8 +2120,11 @@ int __cdecl lua_orb(lua_State* L) {
     return 1;
 }
 
+// As with depth: cycles when called bare, sets when given a value.
 int __cdecl lua_arc(lua_State* L) {
-    g_arc_mode = (g_arc_mode + 1) % 2;
+    g_arc_mode = g_lua.gettop(L) >= 1
+        ? (g_lua.tonumber(L, 1) != 0.0 ? 1 : 0)
+        : (g_arc_mode + 1) % 2;
     g_lua.pushstring(L, g_arc_mode == 0 ? "arc: curved" : "arc: straight");
     return 1;
 }
@@ -2186,8 +2189,12 @@ int __cdecl lua_player(lua_State* L) {
     return 0;
 }
 
+// With no argument this cycles; with one it sets directly, which is what lets
+// Lua hold the authoritative value and push it in without having to read back.
 int __cdecl lua_depth(lua_State* L) {
-    g_depth_mode = (g_depth_mode + 1) % 2;
+    g_depth_mode = g_lua.gettop(L) >= 1
+        ? (g_lua.tonumber(L, 1) != 0.0 ? 1 : 0)
+        : (g_depth_mode + 1) % 2;
     g_lua.pushstring(L, g_depth_mode == 0
         ? "depth ON: line is hidden where the world is in front of it"
         : "depth OFF: line draws over everything (Ashita behaviour)");

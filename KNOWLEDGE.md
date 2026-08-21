@@ -399,6 +399,100 @@ avatar attacking a mob **should draw blue, not red** — needs verifying in game
 
 ---
 
+## 7b. Settings and the config panel
+
+### Lua owns the settings
+
+`settings.lua` holds every tunable, loaded and saved through Windower's `config`
+library. **The module holds no state Lua cannot reproduce**: `apply()` pushes
+everything in on load and after any change.
+
+This was a deliberate refactor. Several settings previously existed *only* inside
+the DLL with no getter, which makes both a config panel and persistence
+impossible -- neither can render or save a value it cannot read back. The DLL's
+`arc` and `depth` also gained the ability to be *set* rather than only cycled,
+for the same reason: a cycle cannot express "make it match this".
+
+The payoff is that the panel and the chat commands are the same thing. Any
+setting is reachable by name (`//tlines arch 0.3`) because the command handler
+falls through to the settings model, so the two cannot drift and new settings get
+a command for free.
+
+`spec` describes each row -- `toggle`, `choice` or `value` -- and drives the
+panel, the commands and the defaults together.
+
+### Windower texts library: three traps
+
+All three cost a debugging round.
+
+**1. `box.text = str` does not set the text.** The library defines
+`__newindex` so *any* assignment defines an interpolation variable:
+
+```lua
+_meta.Text.__newindex = function(t, k, v)
+    set_value(t, k, v)   -- defines ${k}, does not set the text
+```
+
+Use the method `box:text(str)`, which sets `base_str`. Assigning renders an empty
+panel.
+
+**2. Passing a settings root suppresses `apply_settings`.** In `texts.new`:
+
+```lua
+if _libs.config and m.root_settings and settings then
+    _libs.config.register(m.root_settings, apply_settings, t, m.settings)
+else
+    apply_settings(_, t, settings)
+end
+```
+
+and `config.register` **only stores** the callback -- it fires on
+`load`/`login`/`logout`, which have already passed. So the primitive is created
+with no font, size, position or background and renders nothing. Apply the display
+settings explicitly after creating the object.
+
+Passing the root is still worth it: on drag release the library calls
+`config.save(root_settings)` itself, so dragging persists with no drag handling
+of our own.
+
+**3. `extents()` straight after `box:text()` is stale.** The primitive has not
+necessarily redrawn, so it returns the previous text's size or nothing. Measure
+at click time instead, when it has certainly drawn.
+
+### Hit testing
+
+Clicks resolve through a **row map built during render** -- each line records
+what it is -- rather than arithmetic like `spec[row - 2]`. Adding the dividers
+shifted every index and would have broken any positional assumption.
+
+Two modes, because the first attempt failed instructively:
+
+- **zones** (fallback): the control column is the right 45% of the panel, split
+  in half. ~65px targets. Cannot miss.
+- **precise**: maps the pixel to a character column and matches the bracket
+  positions exactly, so clicking the readout does nothing. Needs an accurate
+  character width.
+
+The original precise attempt converted pixels to columns using an *assumed* 8px
+character width when the real one was ~7.5. Half a pixel per character compounds
+to two whole characters by column 36, so the hit test looked left of `[>]` and
+found nothing. MogSafe avoids this entirely by using wide raw pixel bands and no
+character metrics at all -- worth remembering as the robust default whenever
+precision is not actually required.
+
+(A Windower console left open also swallows mouse clicks, which confused the
+first diagnosis. Worth ruling out before suspecting the code.)
+
+### Colour and bold
+
+Text primitives render inline `\cs(r,g,b)` colour codes, closed by `\cr`.
+Colour codes occupy **no width on screen but do occupy characters in the
+string**, so strip them before measuring a line.
+
+There is **no inline bold or italic** -- only colour. `box:bold()` applies to the
+whole object, so per-line bold needs a second text object. `//tlines bold`
+toggles it for the panel.
+
 ## 8. Build and install
 
 32-bit only. FFXI is a 32-bit process.

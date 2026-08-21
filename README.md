@@ -46,6 +46,8 @@ Windower/
     └── TargetLines/
         ├── TargetLines.lua
         ├── tracker.lua
+        ├── settings.lua
+        ├── ui.lua
         ├── libs/
         │   └── _TargetLines.dll
         ├── SceneHook/
@@ -66,6 +68,7 @@ Nothing goes in the `plugins` folder and there is nothing to configure.
 ## Commands
 
 ```
+//tlines config                   open the settings panel
 //tlines                          status
 //tlines help                     this list
 //tlines on | off                 start or stop drawing
@@ -126,6 +129,31 @@ Nothing goes in the `plugins` folder and there is nothing to configure.
 //tlines probe [index|me]         model height, bone count, 16 bone heights
 //tlines scan                     SceneHook bus: owner, slot, client count
 ```
+
+## The settings panel
+
+`//tlines config` opens a clickable panel covering every setting, grouped into
+General, Show, Lines, Attach Height and Area of Effect.
+
+- Toggles flip when you click the box; **green is on, red is off**
+- `[-]` and `[+]` nudge a number, `[<]` and `[>]` step through a list
+- Drag it anywhere by its labels; where you drop it is remembered
+- `[x]` closes it
+
+Everything saves to `data/settings.xml` as you change it, so tuning survives
+reloads and logins.
+
+```
+//tlines bold                     bold the title and headings
+//tlines move <x> <y>             reposition the panel
+//tlines ui precise | zones       click target style
+//tlines ui <rows> <chars>        correct click alignment, in pixels
+//tlines uidebug                  report what each click resolves to
+```
+
+The panel and the chat commands are the same thing: **any setting is reachable
+by name**, so `//tlines arch 0.3`, `//tlines aoe_hold 3` and
+`//tlines show_trust off` all work, and neither route can drift from the other.
 
 Every numeric setting also accepts the word `default` to reset just that one,
 for example `//tlines chest me default` or `//tlines aoe hold default`. Querying
@@ -254,7 +282,8 @@ MinGW works too (`-m32`), per the `else()` branch in `src/CMakeLists.txt`.
       the All / Alliance / Party filter
 - [x] **Stage 4** — auto-attack modes, area-of-effect sweep rings with orbiting
       comets, and role filtering
-- [ ] config UI, settings persistence, per-role opacity
+- [x] **Stage 5** — settings model, clickable config panel, persistence
+- [ ] per-role opacity, colour blind mode
 
 Engineering detail — verified memory offsets, the bone data behind the anchoring
 design, rendering internals and the gotchas — is in

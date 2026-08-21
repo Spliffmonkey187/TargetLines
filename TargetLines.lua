@@ -1,11 +1,11 @@
 _addon.name = 'TargetLines'
 _addon.author = "ported from Jyouya's Ashita addon"
-_addon.version = '0.3.0'
+_addon.version = '0.5.0'
 _addon.commands = {'tlines', 'targetlines'}
 
--- FFXII style target lines. The Lua side tracks who is acting on whom and
--- decides how much of each arc should be showing; the module in libs/ does the
--- drawing, inside the game's own 3D scene so the arcs are occluded by the world.
+-- FFXII style target lines. Lua tracks who is acting on whom and decides what
+-- should be showing; the module in libs/ does the drawing, inside the game's
+-- own 3D scene so the arcs and rings are occluded by the world.
 
 local addon_path = windower.addon_path:gsub('\\', '/')
 package.cpath = package.cpath .. ';' .. addon_path .. '/libs/?.dll'
@@ -13,8 +13,12 @@ package.cpath = package.cpath .. ';' .. addon_path .. '/libs/?.dll'
 local loaded, load_error = pcall(require, '_TargetLines')
 
 local tracker = require('tracker')
+local config = require('settings')
+local ui = require('ui')
+
 local arcs = tracker.arcs
 local TIMEOUTS = tracker.timeouts
+local set = config.settings
 
 -- Ashita's palette, from targetlines.lua.
 local COLOURS = {
@@ -24,62 +28,41 @@ local COLOURS = {
     enemy_friendly = 0xFFFF8800,   -- a monster buffing another monster
 }
 
-local enabled = true
-
--- 'all', 'alliance' or 'party'. Ashita's filter, same meanings.
-local filter = 'all'
-
--- Draw a line to whatever you currently have targeted, whether or not anything
--- is happening. Not in Ashita, but it makes the addon useful out of combat.
-local show_target = true
-
 -- Our own entity index, refreshed every frame because it changes on a zone.
 local player_index = 0
 
--- Defined further down, next to the role table it consults.
-local show_entity
+-- Seconds for an area-of-effect wavefront to reach its full radius.
+local AOE_SWEEP = 0.45
 
 local function chat(message)
     windower.add_to_chat(207, 'TargetLines: ' .. message)
 end
 
--- The module treats this sentinel as "put this setting back to its default".
--- It sits outside every valid range, so no real value can collide with it.
-local RESTORE_DEFAULT = -999
-
--- Which end of a line a chest value applies to. Must match ChestScope in the
--- module.
-local CHEST_BOTH = 0
-local CHEST_SELF = 1
-local CHEST_OTHER = 2
-
--- Read a numeric argument, mapping the words "default" and "reset" onto the
--- sentinel. Returns nil when there is no argument, which means "just report".
-local function setting_arg(word)
-    if not word then
-        return nil
-    end
-
-    local lowered = word:lower()
-    if lowered == 'default' or lowered == 'reset' or lowered == 'defaults' then
-        return RESTORE_DEFAULT
-    end
-
-    return tonumber(word)
-end
-
--- Call a module setter with a value, or with nothing at all so it only reports.
-local function apply(setter, word)
-    local value = setting_arg(word)
-    if value then
-        return setter(value)
-    end
-
-    return setter()
-end
-
 local function available()
     return loaded and _TargetLines ~= nil
+end
+
+-- Push every setting the module needs into it. Called whenever anything
+-- changes, which keeps the module a pure renderer with no state to drift.
+local function apply()
+    if not available() then
+        return
+    end
+
+    _TargetLines.width(set.width)
+    _TargetLines.arch(set.arch)
+    _TargetLines.bow(set.bow)
+    _TargetLines.orb(set.orb)
+    _TargetLines.lift(set.lift)
+    _TargetLines.chest(1, set.chest_me)
+    _TargetLines.chest(2, set.chest_target)
+
+    -- Both of these also cycle when called bare, for the chat commands; given
+    -- a value they set directly, which is what lets Lua stay authoritative.
+    _TargetLines.arc(set.curved and 0 or 1)
+    _TargetLines.depth(set.depth and 0 or 1)
+
+    tracker.mode(set.attacks)
 end
 
 local function mob_by_index(index)
@@ -95,105 +78,7 @@ local function mob_by_index(index)
     return mob
 end
 
--- The index is what lets the module read the live render position; the
--- coordinates are only a fallback for entities it cannot resolve itself.
-local function submit(src_index, dst_index, colour, progress, reverse)
-    local src = mob_by_index(src_index)
-    local dst = mob_by_index(dst_index)
-    if not src or not dst then
-        return
-    end
-
-    -- Both ends must be wanted. Hiding trusts should hide the line a trust
-    -- draws onto a mob as well as any line drawn onto the trust.
-    if not show_entity(src) or not show_entity(dst) then
-        return
-    end
-
-    _TargetLines.add(
-        src_index, src.x or 0, src.y or 0, src.z or 0,
-        dst_index, dst.x or 0, dst.y or 0, dst.z or 0,
-        COLOURS[colour] or COLOURS.player,
-        progress,
-        reverse and 1 or 0)
-end
-
--- The set of entity indices the filter cares about: party or alliance members,
--- plus whatever they are currently engaged with, so an incoming line from the
--- mob your tank is holding still shows.
-local function relevant_indices()
-    local set = {}
-    local ok, party = pcall(windower.ffxi.get_party)
-    if not ok or not party then
-        return nil
-    end
-
-    local slots = filter == 'party'
-        and {'p0', 'p1', 'p2', 'p3', 'p4', 'p5'}
-        or {'p0', 'p1', 'p2', 'p3', 'p4', 'p5',
-            'a10', 'a11', 'a12', 'a13', 'a14', 'a15',
-            'a20', 'a21', 'a22', 'a23', 'a24', 'a25'}
-
-    for _, slot in ipairs(slots) do
-        local member = party[slot]
-        local mob = member and member.mob
-        if mob and mob.index then
-            set[mob.index] = true
-            if mob.target_index and mob.target_index ~= 0 then
-                set[mob.target_index] = true
-            end
-        end
-    end
-
-    return set
-end
-
--- How much of the arc should be showing, and which end it is growing from.
---
--- Ashita's three phases, unchanged:
---   fresh      grows out from the actor over half a second
---   sustained  a player line held on one target for 2.5s retracts and goes,
---              so a long fight does not leave a permanent beam
---   expiring   retracts back into the target over the last half second
---
--- Retracting arcs are drawn from the target end, which is what `reverse` says.
-local function phase(arc, now)
-    local timeout = TIMEOUTS[arc.colour]
-    local age = now - arc.clock
-    local held = arc.first_clock and (now - arc.first_clock)
-
-    -- Ashita retires a player line 2.5s after it first appeared, retracting it
-    -- over the following half second. This always applies: it is the fade that
-    -- follows the orb in, and losing it makes the line a static beam.
-    --
-    -- Persistence in repeat mode comes from the tracker replaying the arc on
-    -- each attack instead, so the line pulses with the swing rhythm.
-    if arc.colour == 'player' and held and held > 2.5 then
-        return math.max((3 - held) * 2, 0), true
-    end
-
-    if age > timeout - 0.5 then
-        return math.min(1 - (0.5 - math.min(timeout - age, 1)) * 2, 1), true
-    end
-
-    return math.min(1 - (0.5 - math.min(age, 1)) * 2, 1), false
-end
-
--- Which kinds of entity draw anything at all -- lines and rings alike.
---
--- Finer than the party/alliance filter, which asks "is this near me"; this asks
--- "do I care about this sort of thing". Trusts in particular are noisy, since a
--- full set of five fills the screen on their own.
-local show = {
-    me = true,
-    party = true,
-    trust = true,
-    pet = true,
-    alliance = true,
-    others = true,   -- players outside your party and alliance
-    enemy = true,
-}
-
+-- Which kind of entity this is, for the Show filters.
 local ROLE_ORDER = {'me', 'party', 'trust', 'pet', 'alliance', 'others', 'enemy'}
 
 local function role_of(mob)
@@ -226,43 +111,90 @@ local function role_of(mob)
     return 'others'
 end
 
-function show_entity(mob)
+local function show_entity(mob)
     local role = role_of(mob)
-    return role == nil or show[role] ~= false
+    return role == nil or set['show_' .. role] ~= false
 end
 
--- Area-of-effect bursts.
+-- The index is what lets the module read the live render position; the
+-- coordinates are only a fallback for entities it cannot resolve itself.
+local function submit(src_index, dst_index, colour, progress, reverse)
+    local src = mob_by_index(src_index)
+    local dst = mob_by_index(dst_index)
+    if not src or not dst then
+        return
+    end
+
+    -- Both ends must be wanted. Hiding trusts should hide the line a trust
+    -- draws onto a mob as well as any line drawn onto the trust.
+    if not show_entity(src) or not show_entity(dst) then
+        return
+    end
+
+    _TargetLines.add(
+        src_index, src.x or 0, src.y or 0, src.z or 0,
+        dst_index, dst.x or 0, dst.y or 0, dst.z or 0,
+        COLOURS[colour] or COLOURS.player,
+        progress,
+        reverse and 1 or 0)
+end
+
+-- The set of entity indices the party filter cares about: party or alliance
+-- members, plus whatever they are engaged with, so an incoming line from the
+-- mob your tank is holding still shows.
+local function relevant_indices()
+    local wanted = {}
+    local ok, party = pcall(windower.ffxi.get_party)
+    if not ok or not party then
+        return nil
+    end
+
+    local slots = set.filter == 'party'
+        and {'p0', 'p1', 'p2', 'p3', 'p4', 'p5'}
+        or {'p0', 'p1', 'p2', 'p3', 'p4', 'p5',
+            'a10', 'a11', 'a12', 'a13', 'a14', 'a15',
+            'a20', 'a21', 'a22', 'a23', 'a24', 'a25'}
+
+    for _, slot in ipairs(slots) do
+        local member = party[slot]
+        local mob = member and member.mob
+        if mob and mob.index then
+            wanted[mob.index] = true
+            if mob.target_index and mob.target_index ~= 0 then
+                wanted[mob.target_index] = true
+            end
+        end
+    end
+
+    return wanted
+end
+
+-- How much of the arc should be showing, and which end it is growing from.
 --
--- A wavefront expands from the centre to the radius the action actually
--- reached, and each entity it catches gets a small ring as the front passes
--- over it. That ordering is the point: the sweep shows the extent, the small
--- rings show who was in it.
-local AOE_SWEEP = 0.45      -- seconds for the front to reach full radius
-local aoe_enabled = true
+-- Ashita's three phases, unchanged:
+--   fresh      grows out from the actor over half a second
+--   sustained  a player line held on one target for 2.5s retracts and goes,
+--              so a long fight does not leave a permanent beam
+--   expiring   retracts back into the target over the last half second
+--
+-- Retracting arcs are drawn from the target end, which is what reverse says.
+local function phase(arc, now)
+    local timeout = TIMEOUTS[arc.colour]
+    local age = now - arc.clock
+    local held = arc.first_clock and (now - arc.first_clock)
 
--- Tunables, all reachable from //tlines.
-local aoe = {
-    hold = 2.20,      -- seconds a burst stays on screen
-    lift = 0.00,      -- yalms the big caster ring floats off the ground
-    radius = 1.10,    -- yalms, the comet ring drawn on each entity caught
-    chest = 0.55,     -- height of that comet as a fraction of the model
-    orbit = 1.30,     -- turns per second the comet travels
-    tail = 2.60,      -- radians of trail behind its head
+    if arc.colour == 'player' and held and held > 2.5 then
+        return math.max((3 - held) * 2, 0), true
+    end
 
-    -- Thickness relative to the line width. The comets run heavier because
-    -- their taper thins the tail to about a quarter, and a 3px line is
-    -- sub-pixel by then. The sweep ring is a big shape and needs less.
-    width = 2.20,
-    sweepwidth = 1.30,
-}
+    if age > timeout - 0.5 then
+        return math.min(1 - (0.5 - math.min(timeout - age, 1)) * 2, 1), true
+    end
 
--- Copied so `default` has something to restore to.
-local AOE_DEFAULTS = {}
-for name, value in pairs(aoe) do
-    AOE_DEFAULTS[name] = value
+    return math.min(1 - (0.5 - math.min(age, 1)) * 2, 1), false
 end
 
--- Fade an ARGB colour by a 0..1 factor, and optionally scale it further.
+-- Fade an ARGB colour by a 0..1 factor.
 local function faded(colour, alpha)
     if alpha <= 0 then
         return nil
@@ -276,14 +208,19 @@ local function faded(colour, alpha)
     return (a * 0x1000000) + (colour % 0x1000000)
 end
 
+-- Area-of-effect bursts.
+--
+-- A wavefront expands to the radius the action actually reached, and each
+-- entity it catches gets a comet as the front passes over it. That ordering is
+-- the point: the sweep shows the extent, the comets show who was in it.
 local function draw_bursts(now)
-    if not aoe_enabled then
+    if not set.aoe then
         return
     end
 
     for key, burst in pairs(tracker.bursts) do
         local age = now - burst.clock
-        if age > aoe.hold then
+        if age > set.aoe_hold then
             tracker.bursts[key] = nil
         else
             local sweep = math.min(age / AOE_SWEEP, 1)
@@ -292,7 +229,7 @@ local function draw_bursts(now)
             -- The front holds full brightness while it travels and only fades
             -- once it has arrived, so the eye follows the expansion outward
             -- rather than watching the whole thing dim.
-            local settle = math.max(aoe.hold - AOE_SWEEP, 0.01)
+            local settle = math.max(set.aoe_hold - AOE_SWEEP, 0.01)
             local front = sweep < 1 and 1
                 or math.max(1 - (age - AOE_SWEEP) / settle, 0)
 
@@ -303,14 +240,13 @@ local function draw_bursts(now)
                     burst.centre_x, burst.centre_y, burst.centre_z,
                     burst.radius * sweep,
                     colour,
-                    0, aoe.lift, 0, 0, aoe.sweepwidth)
+                    0, set.aoe_lift, 0, 0, set.aoe_sweepwidth)
             end
 
-            -- One comet per entity caught, each starting as the wavefront
-            -- reaches it, so the hits light up in distance order. The head
-                -- angle advances with time, which is what makes it orbit.
+            -- The head angle advances with time, which is what makes the
+            -- comets orbit.
             local reached = burst.radius * sweep
-            local head = age * aoe.orbit * 6.2831853
+            local head = age * set.aoe_orbit * 6.2831853
 
             for _, target in ipairs(burst.targets) do
                 local mob = mob_by_index(target.index)
@@ -320,13 +256,13 @@ local function draw_bursts(now)
                     local distance = math.sqrt(dx * dx + dy * dy)
 
                     if reached >= distance then
-                        local hit = faded(base, math.max(1 - age / aoe.hold, 0))
+                        local hit = faded(base, math.max(1 - age / set.aoe_hold, 0))
                         if hit then
                             _TargetLines.ring(target.index,
                                 mob.x or 0, mob.y or 0, mob.z or 0,
-                                aoe.radius, hit,
-                                1, aoe.chest,
-                                head, aoe.tail, aoe.width)
+                                set.aoe_radius, hit,
+                                1, set.aoe_chest,
+                                head, set.aoe_tail, set.aoe_width)
                         end
                     end
                 end
@@ -335,6 +271,10 @@ local function draw_bursts(now)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- Events
+-- ---------------------------------------------------------------------------
+
 windower.register_event('load', function()
     if not available() then
         chat('the module failed to load: ' .. tostring(load_error))
@@ -342,9 +282,13 @@ windower.register_event('load', function()
     end
 
     chat(_TargetLines.start())
+    apply()
+    ui.init(config, apply)
 end)
 
 windower.register_event('unload', function()
+    ui.hide()
+
     if available() then
         _TargetLines.clear()
         -- Leave the shared scene hook, rather than just stopping. The module
@@ -354,185 +298,12 @@ windower.register_event('unload', function()
     end
 end)
 
-windower.register_event('addon command', function(command, ...)
-    if not available() then
-        chat('the module failed to load: ' .. tostring(load_error))
-        return
-    end
-
-    local args = {...}
-    command = command and command:lower() or 'status'
-
-    if command == 'on' then
-        enabled = true
-        _TargetLines.start()
-        chat('enabled')
-    elseif command == 'off' then
-        enabled = false
-        _TargetLines.clear()
-        _TargetLines.stop()
-        chat('disabled')
-    elseif command == 'filter' then
-        local want = args[1] and args[1]:lower()
-        if want == 'all' or want == 'alliance' or want == 'party' then
-            filter = want
-        end
-        chat('filter: ' .. filter)
-    elseif command == 'target' then
-        show_target = not show_target
-        chat('line to current target: ' .. (show_target and 'on' or 'off'))
-    elseif command == 'aoe' then
-        -- //tlines aoe [setting] [value]
-        local setting = args[1] and args[1]:lower()
-        if not setting then
-            aoe_enabled = not aoe_enabled
-            chat('area-of-effect rings: ' .. (aoe_enabled and 'on' or 'off'))
-        elseif aoe[setting] ~= nil then
-            local value = setting_arg(args[2])
-            if value == RESTORE_DEFAULT then
-                value = AOE_DEFAULTS[setting]
-            end
-            if value then
-                aoe[setting] = value
-            end
-            chat(('aoe %s: %.2f (default %.2f)')
-                :format(setting, aoe[setting], AOE_DEFAULTS[setting]))
-        else
-            chat('aoe settings: hold, lift, radius, chest, orbit, tail, width, sweepwidth')
-        end
-    elseif command == 'show' then
-        -- //tlines show <role> [on|off], or with no role, list them all.
-        local role = args[1] and args[1]:lower()
-        if role == 'all' or role == 'none' then
-            for _, name in ipairs(ROLE_ORDER) do
-                show[name] = role == 'all'
-            end
-            chat('all roles: ' .. (role == 'all' and 'on' or 'off'))
-        elseif show[role] ~= nil then
-            local want = args[2] and args[2]:lower()
-            if want == 'on' then
-                show[role] = true
-            elseif want == 'off' then
-                show[role] = false
-            else
-                show[role] = not show[role]
-            end
-            chat(('%s: %s'):format(role, show[role] and 'on' or 'off'))
-        else
-            local parts = {}
-            for _, name in ipairs(ROLE_ORDER) do
-                parts[#parts + 1] = ('%s %s'):format(name, show[name] and 'on' or 'off')
-            end
-            chat(table.concat(parts, ', '))
-        end
-    elseif command == 'attacks' then
-        local want = args[1] and args[1]:lower()
-        if want == 'persistent' then
-            want = 'repeat'
-        end
-
-        local mode = tracker.mode(want)
-        local described = {
-            first = 'one line per engagement',
-            ['repeat'] = 'persistent while the attacks keep coming',
-            off = 'no auto-attack lines, abilities and spells only',
-        }
-        chat(('auto-attacks: %s - %s'):format(mode, described[mode]))
-    elseif command == 'arc' then
-        chat(_TargetLines.arc())
-    elseif command == 'reset' then
-        chat(_TargetLines.reset())
-    elseif command == 'arch' then
-        chat(apply(_TargetLines.arch, args[1]))
-    elseif command == 'bow' then
-        chat(apply(_TargetLines.bow, args[1]))
-    elseif command == 'orb' then
-        chat(apply(_TargetLines.orb, args[1]))
-    elseif command == 'anchor' then
-        chat(_TargetLines.anchor())
-    elseif command == 'chest' then
-        -- //tlines chest [me|target] [value|default]
-        -- With no scope word the value applies to both ends.
-        local scope, word = CHEST_BOTH, args[1]
-        local first = args[1] and args[1]:lower()
-        if first == 'me' or first == 'self' or first == 'player' then
-            scope, word = CHEST_SELF, args[2]
-        elseif first == 'target' or first == 'tgt' or first == 'other' then
-            scope, word = CHEST_OTHER, args[2]
-        end
-
-        local value = setting_arg(word)
-        if value then
-            chat(_TargetLines.chest(scope, value))
-        else
-            chat(_TargetLines.chest())
-        end
-    elseif command == 'bones' then
-        chat(apply(_TargetLines.bones, args[1]))
-    elseif command == 'bone' then
-        chat(apply(_TargetLines.bone, args[1]))
-    elseif command == 'depth' then
-        chat(_TargetLines.depth())
-    elseif command == 'lift' then
-        -- apply() passes nothing when there is no argument. A nil argument
-        -- would still reach the module as 0, silently flattening the lift
-        -- instead of reporting it.
-        chat(apply(_TargetLines.lift, args[1]))
-    elseif command == 'width' then
-        chat(apply(_TargetLines.width, args[1]))
-    elseif command == 'scan' then
-        chat(_TargetLines.scan())
-    elseif command == 'probe' then
-        -- No argument probes your target; "me" probes your own model.
-        local index = tonumber(args[1])
-        if not index then
-            local who = (args[1] and args[1]:lower() == 'me') and 'me' or 't'
-            local ok, mob = pcall(windower.ffxi.get_mob_by_target, who)
-            if ok and mob then
-                index = mob.index
-            end
-        end
-
-        if not index then
-            chat('probe: target something, or pass an index, or "me"')
-        else
-            chat(_TargetLines.probe(index))
-        end
-    elseif command == 'help' then
-        chat('//tlines on | off          start or stop drawing')
-        chat('//tlines filter <mode>     all / alliance / party')
-        chat('//tlines attacks <mode>    first / repeat / off, for auto-attacks')
-        chat('//tlines aoe               toggle area-of-effect rings')
-        chat('//tlines aoe <name> <n>    hold/lift/radius/chest/orbit/tail')
-        chat('//tlines show <role> [on|off]  me party trust pet alliance')
-        chat('                               others enemy, or all / none')
-        chat('//tlines target            toggle the line to your current target')
-        chat('//tlines arc               toggle curved arc vs straight line')
-        chat('//tlines arch <0-2>        arc rise as a fraction of the distance')
-        chat('//tlines bow <degrees>     sideways lean of the arc')
-        chat('//tlines orb <pixels>      size of the travelling dot')
-        chat('//tlines anchor            cycle model / bone / nameplate / entity')
-        chat('//tlines chest [me|target] <0-1>   attach height on the model')
-        chat('//tlines bones <n>         bones used to measure model height')
-        chat('//tlines depth             world occlusion vs always on top')
-        chat('//tlines lift <yalms>      extra height, every anchor mode')
-        chat('//tlines width <pixels>    line thickness')
-        chat('//tlines probe [index|me]  survey the anchors and bones')
-        chat('//tlines reset             put every setting back to default')
-        chat('any setting also takes "default", e.g. //tlines chest default')
-    else
-        chat(_TargetLines.status())
-        chat(('filter %s, auto-attacks %s, target line %s, %d arc(s) tracked')
-            :format(filter, tracker.mode(), show_target and 'on' or 'off', (function()
-                local n = 0
-                for _ in pairs(arcs) do n = n + 1 end
-                return n
-            end)()))
-    end
+windower.register_event('mouse', function(kind, x, y)
+    return ui.mouse(kind, x, y)
 end)
 
 windower.register_event('prerender', function()
-    if not available() or not enabled then
+    if not available() or not set.enabled then
         return
     end
 
@@ -552,7 +323,7 @@ windower.register_event('prerender', function()
     _TargetLines.player(player_index)
 
     local now = os.clock()
-    local wanted = filter ~= 'all' and relevant_indices() or nil
+    local wanted = set.filter ~= 'all' and relevant_indices() or nil
 
     for src_index, arc in pairs(arcs) do
         if now - arc.clock > TIMEOUTS[arc.colour] then
@@ -570,7 +341,7 @@ windower.register_event('prerender', function()
 
     draw_bursts(now)
 
-    if show_target then
+    if set.target_line then
         local ok, me = pcall(windower.ffxi.get_mob_by_target, 'me')
         local ok2, target = pcall(windower.ffxi.get_mob_by_target, 't')
         if ok and ok2 and me and target and me.index ~= target.index
@@ -578,5 +349,238 @@ windower.register_event('prerender', function()
             submit(me.index, target.index,
                 target.is_npc and 'player' or 'player_friendly', 1, false)
         end
+    end
+end)
+
+-- ---------------------------------------------------------------------------
+-- Commands
+--
+-- Everything the panel can do is reachable by typing too, and both go through
+-- the same settings model, so neither can drift from the other.
+-- ---------------------------------------------------------------------------
+
+-- Settings whose command name differs from the setting name, or which take a
+-- scope word. Everything else is matched directly against the settings model.
+local ALIASES = {
+    arc = 'curved',
+    aoerings = 'aoe',
+    target = 'target_line',
+    curve = 'curved',
+}
+
+local function report(name)
+    local row = config.row(name)
+    local fallback = config.defaults[name]
+    if row and row.type == 'toggle' then
+        fallback = fallback and 'ON' or 'OFF'
+    end
+
+    chat(('%s: %s (default %s)'):format(
+        row and row.label or name,
+        config.display(name),
+        tostring(fallback)))
+end
+
+local function assign(name, word)
+    if not word then
+        report(name)
+        return
+    end
+
+    local row = config.row(name)
+    local lowered = word:lower()
+
+    if lowered == 'default' or lowered == 'reset' then
+        config.set(name, config.defaults[name])
+    elseif row and row.type == 'toggle' then
+        if lowered == 'on' then
+            config.set(name, true)
+        elseif lowered == 'off' then
+            config.set(name, false)
+        else
+            config.nudge(name, 1)
+        end
+    elseif not config.set(name, tonumber(word) or lowered) then
+        chat(('%s: %s is not valid'):format(name, word))
+        return
+    end
+
+    apply()
+    config.save()
+    report(name)
+end
+
+windower.register_event('addon command', function(command, ...)
+    if not available() then
+        chat('the module failed to load: ' .. tostring(load_error))
+        return
+    end
+
+    local args = {...}
+    command = command and command:lower() or 'status'
+    command = ALIASES[command] or command
+
+    if command == 'config' or command == 'menu' then
+        chat('config panel: ' .. (ui.toggle() and 'shown' or 'hidden'))
+    elseif command == 'on' then
+        config.set('enabled', true)
+        _TargetLines.start()
+        apply()
+        config.save()
+        chat('enabled')
+    elseif command == 'off' then
+        config.set('enabled', false)
+        _TargetLines.clear()
+        _TargetLines.stop()
+        config.save()
+        chat('disabled')
+    elseif command == 'reset' then
+        config.reset()
+        apply()
+        config.save()
+        ui.render()
+        chat('every setting back to default')
+    elseif command == 'bold' then
+        -- Windower has no inline bold, so this is the whole panel.
+        chat('panel bold: ' .. (ui.bold() and 'on' or 'off'))
+    elseif command == 'uidebug' then
+        chat('click diagnostics: ' .. (ui.debug(chat) and 'on' or 'off'))
+    elseif command == 'ui' then
+        -- Row height and character width in pixels, used only to map a
+        -- click back to a control. If clicks land on the wrong row or
+        -- miss the arrows, these are what to correct.
+        local first = args[1] and args[1]:lower()
+        if first == 'precise' or first == 'zones' then
+            set.ui_precise = first == 'precise'
+            config.save()
+            chat(('click targets: %s'):format(set.ui_precise
+                and 'exact brackets' or 'half the control column each'))
+        elseif first == 'auto' then
+            set.ui_auto = true
+            config.save()
+            chat('panel grid: measured from the rendered font')
+        else
+            local rows = tonumber(args[1])
+            local chars = tonumber(args[2])
+            if rows then
+                set.ui_row = rows
+            end
+            if chars then
+                set.ui_char = chars
+            end
+            -- Giving numbers means taking manual control; ui auto hands
+            -- it back to the measurement.
+            set.ui_auto = not (rows or chars)
+            config.save()
+            chat(('panel grid: %s, %.2f px rows, %.2f px characters')
+                :format(set.ui_auto and 'measured' or 'manual',
+                    set.ui_row, set.ui_char))
+        end
+    elseif command == 'move' then
+        local x = tonumber(args[1])
+        local y = tonumber(args[2])
+        if x and y then
+            ui.move(x, y)
+            chat(('config panel moved to %d, %d'):format(x, y))
+        else
+            chat('usage: //tlines move <x> <y>')
+        end
+    elseif command == 'show' then
+        -- //tlines show <role> [on|off], or with no role, list them all.
+        local role = args[1] and args[1]:lower()
+        if role == 'all' or role == 'none' then
+            for _, name in ipairs(ROLE_ORDER) do
+                config.set('show_' .. name, role == 'all')
+            end
+            config.save()
+            ui.render()
+            chat('all roles: ' .. (role == 'all' and 'on' or 'off'))
+        elseif role and config.row('show_' .. role) then
+            assign('show_' .. role, args[2] or 'toggle')
+            ui.render()
+        else
+            local parts = {}
+            for _, name in ipairs(ROLE_ORDER) do
+                parts[#parts + 1] = ('%s %s'):format(name, config.display('show_' .. name))
+            end
+            chat(table.concat(parts, ', '))
+        end
+    elseif command == 'aoe' then
+        -- //tlines aoe            toggles the rings
+        -- //tlines aoe <name> <n> adjusts one of the aoe settings
+        local name = args[1] and ('aoe_' .. args[1]:lower())
+        if name and config.row(name) then
+            assign(name, args[2])
+            ui.render()
+        elseif args[1] then
+            chat('aoe settings: hold, lift, sweepwidth, radius, chest, orbit, tail, width')
+        else
+            assign('aoe', 'toggle')
+            ui.render()
+        end
+    elseif command == 'chest' then
+        -- //tlines chest [me|target] <value>
+        local first = args[1] and args[1]:lower()
+        if first == 'me' or first == 'self' or first == 'player' then
+            assign('chest_me', args[2])
+        elseif first == 'target' or first == 'tgt' or first == 'other' then
+            assign('chest_target', args[2])
+        elseif args[1] then
+            assign('chest_me', args[1])
+            assign('chest_target', args[1])
+        else
+            report('chest_me')
+            report('chest_target')
+        end
+        ui.render()
+    elseif config.row(command) then
+        -- Anything named the same as a setting is handled generically.
+        assign(command, args[1])
+        ui.render()
+    elseif command == 'anchor' then
+        chat(_TargetLines.anchor())
+    elseif command == 'bones' then
+        chat(args[1] and _TargetLines.bones(tonumber(args[1])) or _TargetLines.bones())
+    elseif command == 'bone' then
+        chat(args[1] and _TargetLines.bone(tonumber(args[1])) or _TargetLines.bone())
+    elseif command == 'scan' then
+        chat(_TargetLines.scan())
+    elseif command == 'probe' then
+        local index = tonumber(args[1])
+        if not index then
+            local who = (args[1] and args[1]:lower() == 'me') and 'me' or 't'
+            local ok, mob = pcall(windower.ffxi.get_mob_by_target, who)
+            if ok and mob then
+                index = mob.index
+            end
+        end
+
+        if not index then
+            chat('probe: target something, or pass an index, or "me"')
+        else
+            chat(_TargetLines.probe(index))
+        end
+    elseif command == 'help' then
+        chat('//tlines config            open the settings panel')
+        chat('//tlines on | off          start or stop drawing')
+        chat('//tlines reset             every setting back to default')
+        chat('//tlines show <role>       me party trust pet alliance others enemy')
+        chat('//tlines aoe [name] [n]    area-of-effect rings')
+        chat('//tlines chest [me|target] <0-1>   where lines attach')
+        chat('//tlines <setting> [value] any setting by name, see the panel')
+        chat('//tlines probe [index|me]  survey the anchors and bones')
+        chat('//tlines move <x> <y>      reposition the panel')
+        chat('//tlines ui <rows> <chars> fix click alignment, in pixels')
+        chat('//tlines ui precise | zones   click target style')
+        chat('//tlines bold             bold the whole panel')
+    else
+        chat(_TargetLines.status())
+        chat(('filter %s, auto-attacks %s, target line %s, %d arc(s) tracked')
+            :format(set.filter, set.attacks,
+                config.display('target_line'), (function()
+                    local n = 0
+                    for _ in pairs(arcs) do n = n + 1 end
+                    return n
+                end)()))
     end
 end)
