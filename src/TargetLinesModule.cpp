@@ -113,6 +113,39 @@ struct Line {
     bool active = false;
 };
 
+// An area-of-effect indicator: a ring lying flat on the ground. Lua drives the
+// animation and hands over the radius and colour it wants this frame, so the
+// timing can be tuned without rebuilding the module.
+struct Ring {
+    DWORD index = 0;
+    Position fallback {};
+    float radius = 0.0f;
+    DWORD color = 0xFFFFFFFF;
+
+    // How the ring's height is found:
+    //   0  the entity's feet, raised by `amount` yalms
+    //   1  a fraction `amount` of the entity's own height, like the line anchor
+    int mode = 0;
+    float amount = 0.0f;
+
+    // A partial arc instead of a closed ring: `extent` radians ending at
+    // `head`. Zero extent means the whole circle. A partial arc is drawn as a
+    // comet -- tapering in width and fading toward its tail, with the
+    // travelling orb at its head.
+    float head = 0.0f;
+    float extent = 0.0f;
+
+    // Thickness relative to the line width. Rings want to be heavier than the
+    // arcs by default, because the comet taper thins its own tail to a quarter
+    // and a three pixel line ends up sub-pixel there.
+    float width = 1.0f;
+
+    bool active = false;
+};
+
+constexpr int kMaxRings = 64;
+constexpr int kRingSegments = 48;
+
 constexpr int kMaxLines = 64;
 constexpr int kMaxBatchVertices = 8190;
 // Stage 1 draws straight ribbons, but the emitter is written for a polyline so
@@ -213,6 +246,13 @@ int g_depth_mode = 0;
 
 Line g_lines[kMaxLines] {};
 volatile int g_line_count = 0;
+
+Ring g_rings[kMaxRings] {};
+volatile int g_ring_count = 0;
+
+// How far above the ground the ring sits, in yalms. Just enough to clear the
+// terrain and avoid z-fighting with it.
+float g_ring_clearance = 0.05f;
 
 char g_status[192] = "idle";
 
@@ -928,8 +968,20 @@ struct RibbonSample {
 
 RibbonSample ribbon_[kMaxRibbonPoints] {};
 
+// Scale a colour's alpha, returning it unchanged at 1.
+DWORD scale_alpha(DWORD color, float scale) {
+    float const alpha = static_cast<float>((color >> 24) & 0xFF) * scale;
+    DWORD const clamped = static_cast<DWORD>(
+        std::fmax(0.0f, std::fmin(255.0f, alpha)) + 0.5f);
+    return (clamped << 24) | (color & 0x00FFFFFF);
+}
+
+// `taper` turns the ribbon into a comet: thin and faint at the start, full
+// width and brightness at the end. Following the curve used by MogSafe's
+// indicator, since it reads well -- alpha rises with the square of the distance
+// along, which keeps the tail long and wispy rather than a blunt wedge.
 void emit_ribbon(Position const* points, int count, DWORD color,
-    D3DVIEWPORT8 const& viewport) {
+    D3DVIEWPORT8 const& viewport, bool taper = false, float width_scale = 1.0f) {
     if (count < 2 || count > kMaxRibbonPoints) {
         return;
     }
@@ -965,8 +1017,15 @@ void emit_ribbon(Position const* points, int count, DWORD color,
 
         dx /= length;
         dy /= length;
-        sample.nx = -dy * g_half_width;
-        sample.ny = dx * g_half_width;
+
+        float width = g_half_width * width_scale;
+        if (taper) {
+            float const t = static_cast<float>(i) / static_cast<float>(count - 1);
+            width *= 0.28f + 0.72f * t;
+        }
+
+        sample.nx = -dy * width;
+        sample.ny = dx * width;
     }
 
     set_batch_texture(g_beam_texture);
@@ -984,10 +1043,17 @@ void emit_ribbon(Position const* points, int count, DWORD color,
         float const ua = static_cast<float>(i) / static_cast<float>(count - 1);
         float const ub = static_cast<float>(i + 1) / static_cast<float>(count - 1);
 
-        DrawVertex const a_plus {a.x + a.nx, a.y + a.ny, a.z, a.rhw, color, ua, 0.0f};
-        DrawVertex const a_minus {a.x - a.nx, a.y - a.ny, a.z, a.rhw, color, ua, 1.0f};
-        DrawVertex const b_plus {b.x + b.nx, b.y + b.ny, b.z, b.rhw, color, ub, 0.0f};
-        DrawVertex const b_minus {b.x - b.nx, b.y - b.ny, b.z, b.rhw, color, ub, 1.0f};
+        DWORD ca = color;
+        DWORD cb = color;
+        if (taper) {
+            ca = scale_alpha(color, 0.10f + 0.90f * ua * ua);
+            cb = scale_alpha(color, 0.10f + 0.90f * ub * ub);
+        }
+
+        DrawVertex const a_plus {a.x + a.nx, a.y + a.ny, a.z, a.rhw, ca, ua, 0.0f};
+        DrawVertex const a_minus {a.x - a.nx, a.y - a.ny, a.z, a.rhw, ca, ua, 1.0f};
+        DrawVertex const b_plus {b.x + b.nx, b.y + b.ny, b.z, b.rhw, cb, ub, 0.0f};
+        DrawVertex const b_minus {b.x - b.nx, b.y - b.ny, b.z, b.rhw, cb, ub, 1.0f};
 
         quad[0] = a_plus;
         quad[1] = a_minus;
@@ -1159,6 +1225,51 @@ int build_arc(Position const& source, Position const& destination, bool flip,
     }
 
     return samples;
+}
+
+// A circle lying flat on the ground, as a closed polyline. The last point
+// repeats the first so the ribbon emitter closes the loop rather than leaving a
+// notch at the seam.
+//
+// Nothing new is needed to draw it: a ring is just a polyline, so it goes
+// through the same emitter as the arcs and picks up the same beam texture,
+// screen-space thickness and depth handling for free.
+// `extent` of zero or more than a full turn gives a closed ring; anything less
+// gives an arc ending at `head`, which is drawn as a comet.
+int build_ring(Position const& centre, float radius, float head, float extent,
+    Position* out, int capacity) {
+    if (radius <= 0.0f || capacity < 4) {
+        return 0;
+    }
+
+    constexpr float kTwoPi = 6.28318530718f;
+    bool const closed = extent <= 0.0f || extent >= kTwoPi;
+    float const span = closed ? kTwoPi : extent;
+    float const start = closed ? 0.0f : head - extent;
+
+    // Keep the segment density roughly constant so a short comet is not drawn
+    // with the same forty-eight segments as a whole circle.
+    int segments = closed
+        ? kRingSegments
+        : static_cast<int>(std::ceil(span / kTwoPi * kRingSegments));
+    if (segments < 6) {
+        segments = 6;
+    }
+    if (segments + 1 > capacity) {
+        segments = capacity - 1;
+    }
+
+    for (int i = 0; i <= segments; ++i) {
+        float const angle = start + span * static_cast<float>(i)
+            / static_cast<float>(segments);
+        out[i] = Position{
+            centre.east + radius * std::cos(angle),
+            centre.north + radius * std::sin(angle),
+            centre.height,
+        };
+    }
+
+    return segments + 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,6 +1484,75 @@ bool bone_position(std::uintptr_t display, int bone, Position& out) {
     return plausible(check);
 }
 
+// Where an entity is standing. Unlike anchor_position this deliberately takes
+// no lift and no model fraction: a ring belongs on the ground at the model's
+// feet, not up at its chest.
+bool ground_position(DWORD index, Position const& fallback, Position& out) {
+    std::uintptr_t const entity = entity_at(index);
+
+    if (entity != 0) {
+        std::uint32_t display = 0;
+        if (read_memory(entity + kEntityDisplayPtr, display) && display != 0) {
+            float coords[3] {};
+            if (span_readable(display + kDisplayNameplateBase, sizeof(coords))) {
+                std::memcpy(coords,
+                    reinterpret_cast<void const*>(display + kDisplayNameplateBase),
+                    sizeof(coords));
+                if (plausible(coords)) {
+                    out.east = coords[0];
+                    out.height = coords[1];
+                    out.north = coords[2];
+                    return true;
+                }
+            }
+        }
+
+        float coords[3] {};
+        if (span_readable(entity + kEntityDisplayPos, sizeof(coords))) {
+            std::memcpy(coords, reinterpret_cast<void const*>(entity + kEntityDisplayPos),
+                sizeof(coords));
+            if (plausible(coords)) {
+                out.east = coords[0];
+                out.height = coords[1];
+                out.north = coords[2];
+                return true;
+            }
+        }
+    }
+
+    out = fallback;
+    return true;
+}
+
+// Where a ring sits. Mode 0 puts it on the ground, raised by `amount` yalms;
+// mode 1 puts it at a fraction `amount` of the entity's own height, so it
+// encircles the body rather than the feet.
+bool ring_centre(Ring const& ring, Position& out) {
+    if (!ground_position(ring.index, ring.fallback, out)) {
+        return false;
+    }
+
+    if (ring.mode == 1) {
+        std::uintptr_t const entity = entity_at(ring.index);
+        std::uint32_t display = 0;
+        float top = 0.0f;
+        if (entity != 0 && read_memory(entity + kEntityDisplayPtr, display)
+            && display != 0 && model_height(display, top, nullptr)) {
+            // Heights are negative-up, so a fraction of `top` raises it.
+            out.height += top * ring.amount;
+            return true;
+        }
+
+        // No skeleton yet: fall back to a plausible chest height rather than
+        // dropping the ring to the entity's feet.
+        out.height -= 1.0f;
+        return true;
+    }
+
+    out.height -= ring.amount + g_ring_clearance;
+    return true;
+}
+
 // Resolve where a line should attach for an entity index. Falls back down the
 // chain -- bone, then nameplate base, then the entity's own position -- so a
 // mob whose model has not streamed in still gets a line.
@@ -1439,7 +1619,8 @@ void draw_all_lines() {
     }
 
     int const count = g_line_count;
-    if (count <= 0) {
+    int const rings = g_ring_count;
+    if (count <= 0 && rings <= 0) {
         return;
     }
 
@@ -1469,6 +1650,33 @@ void draw_all_lines() {
 
     PendingOrb pending[kMaxLines] {};
     int pending_count = 0;
+
+    // Rings first, so an arc crossing one draws over it rather than under.
+    for (int i = 0; i < rings && i < kMaxRings; ++i) {
+        Ring const& ring = g_rings[i];
+        if (!ring.active || ring.radius <= 0.0f) {
+            continue;
+        }
+
+        Position centre {};
+        if (!ring_centre(ring, centre)) {
+            continue;
+        }
+
+        bool const comet = ring.extent > 0.0f && ring.extent < 6.28318530718f;
+
+        Position path[kMaxRibbonPoints] {};
+        int const points = build_ring(centre, ring.radius, ring.head, ring.extent,
+            path, kMaxRibbonPoints);
+        emit_ribbon(path, points, ring.color, viewport, comet, ring.width);
+
+        // The dot at the head of the comet, the same one the arcs use.
+        if (comet && points > 0 && pending_count < kMaxLines) {
+            pending[pending_count].at = path[points - 1];
+            pending[pending_count].color = ring.color;
+            ++pending_count;
+        }
+    }
 
     for (int i = 0; i < count && i < kMaxLines; ++i) {
         Line const& line = g_lines[i];
@@ -1735,7 +1943,53 @@ int __cdecl lua_clear(lua_State* L) {
         g_lines[i].active = false;
     }
 
+    g_ring_count = 0;
+    for (int i = 0; i < kMaxRings; ++i) {
+        g_rings[i].active = false;
+    }
+
     (void)L;
+    return 0;
+}
+
+// ring(index, x, y, z, radius, color [, mode, amount, head, extent, width])
+//
+// A ring at that entity, or at the given coordinates if the entity cannot be
+// resolved. Lua animates it by passing the radius and the colour, alpha
+// included, that it wants this frame.
+//
+//   mode 0  on the ground, raised `amount` yalms
+//   mode 1  at fraction `amount` of the entity's height, encircling the body
+//
+// A non-zero `extent` draws an arc of that many radians ending at `head`
+// instead of a closed ring, tapered and with the travelling orb at its head.
+int __cdecl lua_ring(lua_State* L) {
+    int const argc = g_lua.gettop(L);
+    if (argc < 6) {
+        return 0;
+    }
+
+    int const slot = g_ring_count;
+    if (slot >= kMaxRings) {
+        return 0;
+    }
+
+    Ring ring {};
+    ring.index = static_cast<DWORD>(g_lua.tonumber(L, 1));
+    ring.fallback.east = static_cast<float>(g_lua.tonumber(L, 2));
+    ring.fallback.north = static_cast<float>(g_lua.tonumber(L, 3));
+    ring.fallback.height = static_cast<float>(g_lua.tonumber(L, 4));
+    ring.radius = static_cast<float>(g_lua.tonumber(L, 5));
+    ring.color = static_cast<DWORD>(g_lua.tonumber(L, 6));
+    ring.mode = argc >= 7 ? static_cast<int>(g_lua.tonumber(L, 7)) : 0;
+    ring.amount = argc >= 8 ? static_cast<float>(g_lua.tonumber(L, 8)) : 0.0f;
+    ring.head = argc >= 9 ? static_cast<float>(g_lua.tonumber(L, 9)) : 0.0f;
+    ring.extent = argc >= 10 ? static_cast<float>(g_lua.tonumber(L, 10)) : 0.0f;
+    ring.width = argc >= 11 ? static_cast<float>(g_lua.tonumber(L, 11)) : 1.0f;
+    ring.active = true;
+
+    g_rings[slot] = ring;
+    g_ring_count = slot + 1;
     return 0;
 }
 
@@ -2124,11 +2378,11 @@ int __cdecl lua_status(lua_State* L) {
 
     std::snprintf(report, sizeof(report),
         "%s | %s | anchor %s, lift %.2f, width %.1fpx, DEPTH %s | %s arch %.2f "
-        "bow %.1f | %d line(s)",
+        "bow %.1f | %d line(s), %d ring(s)",
         g_status, shared, anchor, g_anchor_lift, g_half_width * 2.0f,
         g_depth_mode == 0 ? "OCCLUDED by world" : "ALWAYS ON TOP",
         g_arc_mode == 0 ? "curved" : "straight", g_arc_rise,
-        g_arc_bow * 57.2957795f, g_line_count);
+        g_arc_bow * 57.2957795f, g_line_count, g_ring_count);
     g_lua.pushstring(L, report);
     return 1;
 }
@@ -2188,6 +2442,9 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__TargetLines(lua_State* L) 
 
     g_lua.pushcclosure(L, lua_add, 0);
     g_lua.setfield(L, -2, "add");
+
+    g_lua.pushcclosure(L, lua_ring, 0);
+    g_lua.setfield(L, -2, "ring");
 
     g_lua.pushcclosure(L, lua_anchor, 0);
     g_lua.setfield(L, -2, "anchor");

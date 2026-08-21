@@ -38,6 +38,22 @@ local attack_mode = 'first'
 local seen_attacks = {}
 local REPEAT_COOLDOWN = 3.0
 
+-- Area-of-effect bursts. An action naming several targets gets a ring showing
+-- how far it actually reached, plus a small ring on each entity it caught.
+--
+-- The radius is *inferred* from the distance to the furthest target rather than
+-- looked up, so it is correct for every spell and ability in the game with no
+-- table to maintain. It measures what landed, which is the useful thing.
+local bursts = {}
+local burst_sequence = 0
+
+-- Monster TP moves centre on the monster itself.
+local MOB_TP_MOVE = 11
+
+-- How long a burst stays on screen, in seconds. Short: it is an event, not a
+-- state, and lingering rings would pile up badly in a busy fight.
+local BURST_LIFE = 1.4
+
 -- How long each kind of line lingers, in seconds. Combat lines outlast the
 -- friendly ones so a fight stays readable between rounds.
 local TIMEOUTS = {
@@ -144,6 +160,68 @@ local function forget(actor_index)
     end
 end
 
+-- Which entity an area effect radiates from.
+--
+-- A heuristic, because the packet does not say. Self-buffs and party heals list
+-- the caster among their own targets, and monster TP moves go off where the
+-- monster stands; anything else is a spell or ability aimed at something, so it
+-- centres on what was aimed at.
+local function burst_centre(actor, targets, category)
+    for _, target in ipairs(targets) do
+        if target.index == actor.index then
+            return actor
+        end
+    end
+
+    if category == MOB_TP_MOVE then
+        return actor
+    end
+
+    return targets[1] and targets[1].mob or actor
+end
+
+local function record_burst(actor, targets, category, colour, now)
+    if #targets < 2 then
+        -- One target is a normal action, not an area effect. Drawing a ring
+        -- there would just be a circle the size of the caster's reach.
+        return
+    end
+
+    local centre = burst_centre(actor, targets, category)
+    local cx = tonumber(centre.x) or 0
+    local cy = tonumber(centre.y) or 0
+
+    local radius = 0
+    for _, target in ipairs(targets) do
+        local mob = target.mob
+        if mob then
+            local dx = (tonumber(mob.x) or 0) - cx
+            local dy = (tonumber(mob.y) or 0) - cy
+            local distance = math.sqrt(dx * dx + dy * dy)
+            if distance > radius then
+                radius = distance
+            end
+        end
+    end
+
+    -- Everyone stood on top of the caster: there is no ring worth drawing.
+    if radius < 0.5 then
+        return
+    end
+
+    burst_sequence = burst_sequence + 1
+    bursts[burst_sequence] = {
+        centre_index = centre.index,
+        centre_x = cx,
+        centre_y = cy,
+        centre_z = tonumber(centre.z) or 0,
+        radius = radius,
+        colour = colour,
+        clock = now,
+        targets = targets,
+    }
+end
+
 local function handle_action(data)
     local packet = packets.parse('incoming', data)
     if not packet then
@@ -168,10 +246,20 @@ local function handle_action(data)
         return
     end
 
+    -- Collected for the area-of-effect ring, which needs to see every target at
+    -- once to work out how far the action reached.
+    local hit = {}
+    local burst_colour = nil
+
     -- An action can name several targets; each one gets its own arc, so an AoE
     -- fans out the way it does in FFXII.
     for i = 1, count do
         local target = mob_by_id(packet[('Target %u ID'):format(i)])
+        if target and target.index then
+            hit[#hit + 1] = {index = target.index, mob = target}
+            burst_colour = burst_colour or classify(actor, target)
+        end
+
         if target and target.index and target.index ~= actor.index
             and allow_regular(regular, actor.index, target.index, now) then
             local colour = classify(actor, target)
@@ -210,6 +298,12 @@ local function handle_action(data)
                 first_clock = first_clock,
             }
         end
+    end
+
+    -- Regular attacks never produce a ring: a melee swing hits one target, and
+    -- an auto-attack burst would be constant noise even if it did not.
+    if not regular then
+        record_burst(actor, hit, category, burst_colour or 'player', now)
     end
 end
 
@@ -260,10 +354,16 @@ windower.register_event('zone change', function()
     for key in pairs(seen_attacks) do
         seen_attacks[key] = nil
     end
+
+    for key in pairs(bursts) do
+        bursts[key] = nil
+    end
 end)
 
 return {
     arcs = arcs,
+    bursts = bursts,
+    burst_life = BURST_LIFE,
     timeouts = TIMEOUTS,
     forget = forget,
 

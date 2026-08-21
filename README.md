@@ -78,6 +78,23 @@ Nothing goes in the `plugins` folder and there is nothing to configure.
 //tlines filter <mode>            all | alliance | party          (default all)
 //tlines attacks <mode>           first | repeat | off            (default first)
 //tlines target                   toggle the always-on line to your target
+//tlines show <role> [on|off]     me party trust pet alliance others enemy
+//tlines show all | none          every role at once
+//tlines show                     list what is currently shown
+```
+
+**Area of effect**
+
+```
+//tlines aoe                      toggle the rings entirely
+//tlines aoe hold <seconds>       how long a burst lasts             (2.20)
+//tlines aoe lift <yalms>         float the sweep ring off the ground   (0)
+//tlines aoe sweepwidth <n>       sweep ring thickness, x line width (1.30)
+//tlines aoe radius <yalms>       size of the comet on each target   (1.10)
+//tlines aoe chest <0-1>          comet height, fraction of the model(0.55)
+//tlines aoe orbit <turns/sec>    how fast the comet travels         (1.30)
+//tlines aoe tail <radians>       length of its trail                (2.60)
+//tlines aoe width <n>            comet thickness, x line width      (2.20)
 ```
 
 **Shape of the arc**
@@ -111,8 +128,23 @@ Nothing goes in the `plugins` folder and there is nothing to configure.
 ```
 
 Every numeric setting also accepts the word `default` to reset just that one,
-for example `//tlines chest me default`. Querying any setting reports its
-default alongside the current value.
+for example `//tlines chest me default` or `//tlines aoe hold default`. Querying
+any setting reports its default alongside the current value.
+
+## Area of effect
+
+When an action hits two or more targets, a **sweep ring** expands from the
+caster to the distance the action actually reached, and a **comet** starts
+orbiting each entity it caught as the wavefront passes over it.
+
+The radius is not looked up in a table — it is measured from how far the
+furthest hit target was. That makes it correct for every spell and ability in
+the game, and it shows what genuinely landed rather than a theoretical range.
+
+Where the ring centres is a heuristic: on the caster for self-buffs, party heals
+and monster TP moves, and on the primary target for anything aimed outward.
+
+Regular attacks never produce rings.
 
 ## Line colours and timing
 
@@ -220,7 +252,9 @@ MinGW works too (`-m32`), per the `else()` branch in `src/CMakeLists.txt`.
 - [x] **Stage 3** — port of `tracker.lua`: action packets (`0x028`) and message
       packets (`0x029`), the four line colours, the three animation phases, and
       the All / Alliance / Party filter
-- [ ] config UI and settings persistence
+- [x] **Stage 4** — auto-attack modes, area-of-effect sweep rings with orbiting
+      comets, and role filtering
+- [ ] config UI, settings persistence, per-role opacity
 
 Engineering detail — verified memory offsets, the bone data behind the anchoring
 design, rendering internals and the gotchas — is in

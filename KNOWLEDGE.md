@@ -338,6 +338,61 @@ Suppression is keyed `"actor>target"` and cleared when the arc expires, so
 re-pulling the same mob draws a fresh line rather than staying silent for the
 session. It is also cleared on a zone and whenever the mode changes.
 
+### Area-of-effect bursts
+
+An action naming **two or more** targets records a burst. One target is a normal
+action, and drawing a ring for it would just be a circle the size of the
+caster's reach.
+
+**The radius is inferred, not looked up:** the distance from the centre to the
+furthest target that was actually hit. No table of spell radii to maintain,
+correct for everything in the game, and it shows what landed rather than a
+theoretical range. The idea is MogSafe's; it is a genuinely good one.
+
+**Where it centres** is a heuristic, because the packet does not say:
+
+1. actor is among its own targets → centre on the **actor** (self-buffs, party
+   heals — Protectra)
+2. category 11, a monster TP move → centre on the **actor** (Bomb Toss)
+3. otherwise → centre on the **primary target** (a Firaga aimed at a mob)
+
+This covers the observed cases but will be wrong somewhere. MogSafe keeps
+explicit override tables (`caster_centered_elemental_ra`, `aoe_center_overrides`)
+precisely because the heuristic is not sufficient in general; add overrides as
+counter-examples turn up rather than guessing at a full table.
+
+Regular attacks never produce a burst.
+
+**The visual** is two parts, confirmed against screenshots of Protectra and Bomb
+Toss:
+
+- a **sweep ring** expanding from the centre to the inferred radius over 0.45s,
+  holding full brightness while it travels and only fading once it arrives, so
+  the eye follows the expansion outward;
+- a **comet** on each entity caught, starting as the wavefront reaches it, so the
+  hits light up in distance order.
+
+The comets are *not* static rings. Each is an arc segment orbiting the entity,
+tapering `0.28 → 1.0` in width and fading `0.10 + 0.90·t²` in alpha toward its
+head, with the travelling orb at the head — MogSafe's curve, which reads well,
+plus the head orb his lacks. They sit at a **fraction of the model's height**
+(ring mode 1) so they encircle the body, reusing the self-scaling measurement
+from §5.
+
+Ring thickness is a **multiplier on the line width**, held separately for comets
+(2.2) and the sweep ring (1.3). At 1.0 the comet tail is under a pixel and
+disappears, which is why the defaults are well above 1.
+
+### Role filtering
+
+`//tlines show <role>` gates lines *and* rings by what kind of entity is
+involved: `me`, `party`, `trust`, `pet`, `alliance`, `others`, `enemy`. **Both**
+ends of a line must be shown, so hiding trusts also hides lines drawn onto one.
+
+Trusts are `is_npc` **and** `in_party`, which distinguishes them from both mobs
+and real party members. Pets are `charmed` or have a `pet_owner_id`, and are
+never enemies since they fight for someone.
+
 **Uncertain:** pet/trust detection. Ashita reads spawn flag `0x100`; Windower
 doesn't expose that bit, so we use `charmed` and `pet_owner_id`. A trust or
 avatar attacking a mob **should draw blue, not red** — needs verifying in game.
@@ -414,21 +469,24 @@ so the two add componentwise.
 
 ## 10. Project state
 
-**Working:** SceneHook client (slot 2 alongside TargetRing and GEO-HUD),
-live entity positions, self-scaling model anchoring, depth-occluded rendering,
-world-space Bézier arc with sideways bow, packet-driven combat tracking with
-four colours and three animation phases, procedural glow texture, travelling orb.
-
-Confirmed in game: the textured beam and orb, the three auto-attack modes, and
-mutual engagements bowing to opposite sides.
+**Working, and confirmed in game:** SceneHook client (slot 2 alongside
+TargetRing and GEO-HUD), live entity positions, self-scaling model anchoring,
+depth-occluded rendering, world-space Bézier arcs with the sideways bow,
+packet-driven combat tracking with four colours and three animation phases,
+procedural glow texture, travelling orb, the three auto-attack modes,
+area-of-effect sweep rings with orbiting comets, and role filtering.
 
 **Open questions:**
 - Is a 13-bone cutoff right for all skeletons? Percentile fallback if not.
-- Do trusts/avatars/pets colour correctly?
-- Does the glow read well, or does the beam need more width for the gradient?
+- Do trusts/avatars/pets colour correctly? The role filter now classifies them,
+  but the *line colour* still comes from the older `classify()` in tracker.lua,
+  which uses a cruder test. These two should probably be unified.
+- Does the AoE centring heuristic get anything visibly wrong?
 - Does anything in TargetRing/GEO-HUD glitch from our texture-stage changes?
 
-**Not started:** config UI, settings persistence.
+**Next:** the settings UI and persistence (MogSafe items 4 and 6), which would
+also give the growing pile of `//tlines` settings somewhere to live. Per-role
+opacity after that.
 
 ---
 
@@ -456,19 +514,17 @@ by side for comparison. ~3,400 lines of Lua plus ~3,400 of C++.
 **Take its logic, not its plumbing.** Ideas worth having, in rough order of
 value:
 
-1. **Auto-attack modes** — done, see §7.
-2. **AoE indicators.** When an action names several targets, measure the
-   distance to the *furthest* one and use that as the radius. This infers real
-   spell extent from packet data with no table of spell radii to maintain.
-   Visually: a large ring expanding from the caster plus a **small ring on each
-   entity actually hit**, which shows who was caught rather than just how far it
-   reached. Confirmed against Protectra (green, from a player) and Bomb Toss
-   (red, from a goblin). They also handle spells centred on the caster rather
-   than the target (`caster_centered_elemental_ra`, `aoe_center_overrides`).
-3. **Role filtering** — player / party+trust / pet / enemy / other-party /
-   abilities, each independently toggleable with its own opacity. Finer than our
-   single all/alliance/party filter.
+1. ~~**Auto-attack modes**~~ — done, see §7.
+2. ~~**AoE indicators**~~ — done, see §7. Their `aoe_center_overrides` tables are
+   still worth mining if the centring heuristic proves wrong somewhere.
+3. ~~**Role filtering**~~ — done, see §7. Their **per-role opacity** is not done:
+   they scale player / ally / enemy lines independently, which we do not.
 4. **Settings UI** — a `texts` object plus a `mouse` event handler. Pure Lua, no
    plugin involvement, so it ports directly. Their `config_rows` table driving
-   toggles and choice-lists is a good model.
+   toggles and choice-lists is a good model. **Next up.**
 5. **Colour blind mode**, and their width/opacity scale presets.
+6. **Settings persistence** via Windower's `config` library, with migration for
+   renamed keys. Pairs naturally with 4.
+
+Their base line duration is `action_timeout = 1.5s`, scaled by a `fade_scale`
+preset of 0.80 / 1.00 / 1.25.

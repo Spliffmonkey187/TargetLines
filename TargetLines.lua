@@ -33,6 +33,12 @@ local filter = 'all'
 -- is happening. Not in Ashita, but it makes the addon useful out of combat.
 local show_target = true
 
+-- Our own entity index, refreshed every frame because it changes on a zone.
+local player_index = 0
+
+-- Defined further down, next to the role table it consults.
+local show_entity
+
 local function chat(message)
     windower.add_to_chat(207, 'TargetLines: ' .. message)
 end
@@ -95,6 +101,12 @@ local function submit(src_index, dst_index, colour, progress, reverse)
     local src = mob_by_index(src_index)
     local dst = mob_by_index(dst_index)
     if not src or not dst then
+        return
+    end
+
+    -- Both ends must be wanted. Hiding trusts should hide the line a trust
+    -- draws onto a mob as well as any line drawn onto the trust.
+    if not show_entity(src) or not show_entity(dst) then
         return
     end
 
@@ -167,6 +179,162 @@ local function phase(arc, now)
     return math.min(1 - (0.5 - math.min(age, 1)) * 2, 1), false
 end
 
+-- Which kinds of entity draw anything at all -- lines and rings alike.
+--
+-- Finer than the party/alliance filter, which asks "is this near me"; this asks
+-- "do I care about this sort of thing". Trusts in particular are noisy, since a
+-- full set of five fills the screen on their own.
+local show = {
+    me = true,
+    party = true,
+    trust = true,
+    pet = true,
+    alliance = true,
+    others = true,   -- players outside your party and alliance
+    enemy = true,
+}
+
+local ROLE_ORDER = {'me', 'party', 'trust', 'pet', 'alliance', 'others', 'enemy'}
+
+local function role_of(mob)
+    if not mob then
+        return nil
+    end
+
+    if player_index ~= 0 and mob.index == player_index then
+        return 'me'
+    end
+
+    -- Charmed pets and avatars fight for someone, so they are never enemies.
+    if mob.charmed or (mob.pet_owner_id and mob.pet_owner_id ~= 0) then
+        return 'pet'
+    end
+
+    if mob.in_party then
+        -- Trusts are npcs that are nonetheless party members.
+        return mob.is_npc and 'trust' or 'party'
+    end
+
+    if mob.in_alliance then
+        return 'alliance'
+    end
+
+    if mob.is_npc then
+        return 'enemy'
+    end
+
+    return 'others'
+end
+
+function show_entity(mob)
+    local role = role_of(mob)
+    return role == nil or show[role] ~= false
+end
+
+-- Area-of-effect bursts.
+--
+-- A wavefront expands from the centre to the radius the action actually
+-- reached, and each entity it catches gets a small ring as the front passes
+-- over it. That ordering is the point: the sweep shows the extent, the small
+-- rings show who was in it.
+local AOE_SWEEP = 0.45      -- seconds for the front to reach full radius
+local aoe_enabled = true
+
+-- Tunables, all reachable from //tlines.
+local aoe = {
+    hold = 2.20,      -- seconds a burst stays on screen
+    lift = 0.00,      -- yalms the big caster ring floats off the ground
+    radius = 1.10,    -- yalms, the comet ring drawn on each entity caught
+    chest = 0.55,     -- height of that comet as a fraction of the model
+    orbit = 1.30,     -- turns per second the comet travels
+    tail = 2.60,      -- radians of trail behind its head
+
+    -- Thickness relative to the line width. The comets run heavier because
+    -- their taper thins the tail to about a quarter, and a 3px line is
+    -- sub-pixel by then. The sweep ring is a big shape and needs less.
+    width = 2.20,
+    sweepwidth = 1.30,
+}
+
+-- Copied so `default` has something to restore to.
+local AOE_DEFAULTS = {}
+for name, value in pairs(aoe) do
+    AOE_DEFAULTS[name] = value
+end
+
+-- Fade an ARGB colour by a 0..1 factor, and optionally scale it further.
+local function faded(colour, alpha)
+    if alpha <= 0 then
+        return nil
+    end
+
+    local a = math.floor(((colour / 0x1000000) % 0x100) * math.min(alpha, 1))
+    if a < 1 then
+        return nil
+    end
+
+    return (a * 0x1000000) + (colour % 0x1000000)
+end
+
+local function draw_bursts(now)
+    if not aoe_enabled then
+        return
+    end
+
+    for key, burst in pairs(tracker.bursts) do
+        local age = now - burst.clock
+        if age > aoe.hold then
+            tracker.bursts[key] = nil
+        else
+            local sweep = math.min(age / AOE_SWEEP, 1)
+            local base = COLOURS[burst.colour] or COLOURS.player
+
+            -- The front holds full brightness while it travels and only fades
+            -- once it has arrived, so the eye follows the expansion outward
+            -- rather than watching the whole thing dim.
+            local settle = math.max(aoe.hold - AOE_SWEEP, 0.01)
+            local front = sweep < 1 and 1
+                or math.max(1 - (age - AOE_SWEEP) / settle, 0)
+
+            local colour = faded(base, front)
+            if colour then
+                _TargetLines.ring(
+                    burst.centre_index or 0,
+                    burst.centre_x, burst.centre_y, burst.centre_z,
+                    burst.radius * sweep,
+                    colour,
+                    0, aoe.lift, 0, 0, aoe.sweepwidth)
+            end
+
+            -- One comet per entity caught, each starting as the wavefront
+            -- reaches it, so the hits light up in distance order. The head
+                -- angle advances with time, which is what makes it orbit.
+            local reached = burst.radius * sweep
+            local head = age * aoe.orbit * 6.2831853
+
+            for _, target in ipairs(burst.targets) do
+                local mob = mob_by_index(target.index)
+                if mob and show_entity(mob) then
+                    local dx = (tonumber(mob.x) or 0) - burst.centre_x
+                    local dy = (tonumber(mob.y) or 0) - burst.centre_y
+                    local distance = math.sqrt(dx * dx + dy * dy)
+
+                    if reached >= distance then
+                        local hit = faded(base, math.max(1 - age / aoe.hold, 0))
+                        if hit then
+                            _TargetLines.ring(target.index,
+                                mob.x or 0, mob.y or 0, mob.z or 0,
+                                aoe.radius, hit,
+                                1, aoe.chest,
+                                head, aoe.tail, aoe.width)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
 windower.register_event('load', function()
     if not available() then
         chat('the module failed to load: ' .. tostring(load_error))
@@ -213,6 +381,50 @@ windower.register_event('addon command', function(command, ...)
     elseif command == 'target' then
         show_target = not show_target
         chat('line to current target: ' .. (show_target and 'on' or 'off'))
+    elseif command == 'aoe' then
+        -- //tlines aoe [setting] [value]
+        local setting = args[1] and args[1]:lower()
+        if not setting then
+            aoe_enabled = not aoe_enabled
+            chat('area-of-effect rings: ' .. (aoe_enabled and 'on' or 'off'))
+        elseif aoe[setting] ~= nil then
+            local value = setting_arg(args[2])
+            if value == RESTORE_DEFAULT then
+                value = AOE_DEFAULTS[setting]
+            end
+            if value then
+                aoe[setting] = value
+            end
+            chat(('aoe %s: %.2f (default %.2f)')
+                :format(setting, aoe[setting], AOE_DEFAULTS[setting]))
+        else
+            chat('aoe settings: hold, lift, radius, chest, orbit, tail, width, sweepwidth')
+        end
+    elseif command == 'show' then
+        -- //tlines show <role> [on|off], or with no role, list them all.
+        local role = args[1] and args[1]:lower()
+        if role == 'all' or role == 'none' then
+            for _, name in ipairs(ROLE_ORDER) do
+                show[name] = role == 'all'
+            end
+            chat('all roles: ' .. (role == 'all' and 'on' or 'off'))
+        elseif show[role] ~= nil then
+            local want = args[2] and args[2]:lower()
+            if want == 'on' then
+                show[role] = true
+            elseif want == 'off' then
+                show[role] = false
+            else
+                show[role] = not show[role]
+            end
+            chat(('%s: %s'):format(role, show[role] and 'on' or 'off'))
+        else
+            local parts = {}
+            for _, name in ipairs(ROLE_ORDER) do
+                parts[#parts + 1] = ('%s %s'):format(name, show[name] and 'on' or 'off')
+            end
+            chat(table.concat(parts, ', '))
+        end
     elseif command == 'attacks' then
         local want = args[1] and args[1]:lower()
         if want == 'persistent' then
@@ -290,6 +502,10 @@ windower.register_event('addon command', function(command, ...)
         chat('//tlines on | off          start or stop drawing')
         chat('//tlines filter <mode>     all / alliance / party')
         chat('//tlines attacks <mode>    first / repeat / off, for auto-attacks')
+        chat('//tlines aoe               toggle area-of-effect rings')
+        chat('//tlines aoe <name> <n>    hold/lift/radius/chest/orbit/tail')
+        chat('//tlines show <role> [on|off]  me party trust pet alliance')
+        chat('                               others enemy, or all / none')
         chat('//tlines target            toggle the line to your current target')
         chat('//tlines arc               toggle curved arc vs straight line')
         chat('//tlines arch <0-2>        arc rise as a fraction of the distance')
@@ -332,7 +548,8 @@ windower.register_event('prerender', function()
     -- everyone else at either end of a line. Refreshed every frame because the
     -- index changes on a zone.
     local self_mob = windower.ffxi.get_mob_by_target('me')
-    _TargetLines.player(self_mob and self_mob.index or 0)
+    player_index = self_mob and self_mob.index or 0
+    _TargetLines.player(player_index)
 
     local now = os.clock()
     local wanted = filter ~= 'all' and relevant_indices() or nil
@@ -350,6 +567,8 @@ windower.register_event('prerender', function()
             end
         end
     end
+
+    draw_bursts(now)
 
     if show_target then
         local ok, me = pcall(windower.ffxi.get_mob_by_target, 'me')
