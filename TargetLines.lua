@@ -446,6 +446,9 @@ windower.register_event('addon command', function(command, ...)
     elseif command == 'bold' then
         -- Windower has no inline bold, so this is the whole panel.
         chat('panel bold: ' .. (ui.bold() and 'on' or 'off'))
+    elseif command == 'aoedebug' then
+        chat('aoe centring report: '
+            .. (tracker.aoe_debug(chat) and 'on' or 'off'))
     elseif command == 'uidebug' then
         chat('click diagnostics: ' .. (ui.debug(chat) and 'on' or 'off'))
     elseif command == 'ui' then

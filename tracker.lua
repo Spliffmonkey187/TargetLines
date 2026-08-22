@@ -47,6 +47,10 @@ local REPEAT_COOLDOWN = 3.0
 local bursts = {}
 local burst_sequence = 0
 
+-- Set by //tlines aoedebug. Reports where each burst decided to centre
+-- and why, which is the only way to see a misfire as it happens.
+local burst_report = nil
+
 -- Monster TP moves centre on the monster itself.
 local MOB_TP_MOVE = 11
 
@@ -196,18 +200,66 @@ end
 -- the caster among their own targets, and monster TP moves go off where the
 -- monster stands; anything else is a spell or ability aimed at something, so it
 -- centres on what was aimed at.
-local function burst_centre(actor, targets, category)
+-- How far the furthest target sits from a candidate centre.
+local function spread_from(x, y, targets)
+    local worst = 0
     for _, target in ipairs(targets) do
-        if target.index == actor.index then
-            return actor
+        local mob = target.mob
+        if mob then
+            local dx = (tonumber(mob.x) or 0) - x
+            local dy = (tonumber(mob.y) or 0) - y
+            local distance = math.sqrt(dx * dx + dy * dy)
+            if distance > worst then
+                worst = distance
+            end
         end
     end
 
-    if category == MOB_TP_MOVE then
-        return actor
+    return worst
+end
+
+-- Which entity an area effect radiates from.
+--
+-- The packet does not say, so this was guesswork: centre on the primary target
+-- unless the actor was among its own targets or it was a monster TP move. That
+-- got self-centred effects wrong -- a melee AoE weapon skill hits mobs around
+-- *you*, but you are not one of its targets, so the ring appeared on whichever
+-- mob happened to be listed first.
+--
+-- The remaining case is now measured rather than guessed. The true centre is
+-- the one the targets fit around most tightly, so both candidates are tried and
+-- the tighter wins. A Firaga on a distant pack fits the pack; a Spinning Attack
+-- fits you.
+local function burst_centre(actor, targets, category)
+    -- Listed among its own targets: self-centred by definition.
+    for _, target in ipairs(targets) do
+        if target.index == actor.index then
+            return actor, 'actor is a target'
+        end
     end
 
-    return targets[1] and targets[1].mob or actor
+    -- Monster TP moves go off where the monster stands.
+    if category == MOB_TP_MOVE then
+        return actor, 'monster TP move'
+    end
+
+    local primary = targets[1] and targets[1].mob
+    if not primary then
+        return actor, 'no target position'
+    end
+
+    local from_actor = spread_from(
+        tonumber(actor.x) or 0, tonumber(actor.y) or 0, targets)
+    local from_primary = spread_from(
+        tonumber(primary.x) or 0, tonumber(primary.y) or 0, targets)
+
+    if from_actor <= from_primary then
+        return actor, ('tighter around actor, %.1f vs %.1f')
+            :format(from_actor, from_primary)
+    end
+
+    return primary, ('tighter around target, %.1f vs %.1f')
+        :format(from_primary, from_actor)
 end
 
 local function record_burst(actor, targets, category, colour, now)
@@ -217,21 +269,15 @@ local function record_burst(actor, targets, category, colour, now)
         return
     end
 
-    local centre = burst_centre(actor, targets, category)
+    local centre, reason = burst_centre(actor, targets, category)
     local cx = tonumber(centre.x) or 0
     local cy = tonumber(centre.y) or 0
+    local radius = spread_from(cx, cy, targets)
 
-    local radius = 0
-    for _, target in ipairs(targets) do
-        local mob = target.mob
-        if mob then
-            local dx = (tonumber(mob.x) or 0) - cx
-            local dy = (tonumber(mob.y) or 0) - cy
-            local distance = math.sqrt(dx * dx + dy * dy)
-            if distance > radius then
-                radius = distance
-            end
-        end
+    if burst_report then
+        burst_report(('aoe: %s -> centre %s (%s), radius %.1f, %d targets')
+            :format(tostring(actor.name), tostring(centre.name),
+                reason, radius, #targets))
     end
 
     -- Everyone stood on top of the caster: there is no ring worth drawing.
@@ -394,6 +440,11 @@ return {
     arcs = arcs,
     bursts = bursts,
     role_of = role_of,
+
+    aoe_debug = function(reporter)
+        burst_report = burst_report == nil and reporter or nil
+        return burst_report ~= nil
+    end,
 
     -- Told every frame, because the index changes on a zone.
     set_player = function(index)
