@@ -159,6 +159,14 @@ constexpr DWORD kMaxIndex = 0x900;
 constexpr std::uintptr_t kEntityDisplayPos = 0x004;   // predicted; leads the model
 constexpr std::uintptr_t kEntityDisplayPtr = 0x0A0;
 constexpr std::uintptr_t kDisplayNameplateBase = 0x678;  // east, height, north
+
+// Doors, lamps and similar fixed-model objects are target_type 3, and their
+// entity record sits at a staging position well away from where the mesh is
+// actually drawn -- so a line to a door shot off across the room. For those the
+// display object's own position is the real one. Same handling as TargetRing.
+constexpr std::uintptr_t kDisplayPosition = 0x034;
+constexpr std::uintptr_t kEntityTargetType = 0x0EE;
+constexpr unsigned char kTargetTypeObject = 3;
 constexpr std::uintptr_t kDisplaySkeleton = 0x6B8;
 
 // Skeleton walk, ported from helpers.lua in Jyouya's addon. Bone 2 sits around
@@ -1394,6 +1402,23 @@ bool plausible(float const* coords) {
     return true;
 }
 
+// Which field on the display object actually holds this entity's position.
+// Fixed objects keep theirs somewhere different; see kTargetTypeObject.
+std::uintptr_t position_field_for(DWORD index) {
+    std::uintptr_t const entity = entity_at(index);
+    if (entity == 0) {
+        return kDisplayNameplateBase;
+    }
+
+    unsigned char target_type = 0;
+    if (read_memory(entity + kEntityTargetType, target_type)
+        && target_type == kTargetTypeObject) {
+        return kDisplayPosition;
+    }
+
+    return kDisplayNameplateBase;
+}
+
 // Ashita's helpers.getBone, ported. The skeleton is reached from the display
 // object, walked to its generator array, and the bone's offset is added to the
 // model's base position. Every step is guarded because a model that is still
@@ -1490,13 +1515,14 @@ bool model_height(std::uintptr_t display, float& height, int* which) {
 
 // Attach at a fraction of the model's own height, so the line meets a hare and
 // a dragon at the same point on the body without per-model tuning.
-bool model_position(std::uintptr_t display, float fraction, Position& out) {
+bool model_position(std::uintptr_t display, std::uintptr_t field,
+    float fraction, Position& out) {
     float base[3] {};
-    if (!span_readable(display + kDisplayNameplateBase, sizeof(base))) {
+    if (!span_readable(display + field, sizeof(base))) {
         return false;
     }
 
-    std::memcpy(base, reinterpret_cast<void const*>(display + kDisplayNameplateBase), sizeof(base));
+    std::memcpy(base, reinterpret_cast<void const*>(display + field), sizeof(base));
     if (!plausible(base)) {
         return false;
     }
@@ -1514,13 +1540,14 @@ bool model_position(std::uintptr_t display, float fraction, Position& out) {
     return plausible(check);
 }
 
-bool bone_position(std::uintptr_t display, int bone, Position& out) {
+bool bone_position(std::uintptr_t display, std::uintptr_t field,
+    int bone, Position& out) {
     float base[3] {};
-    if (!span_readable(display + kDisplayNameplateBase, sizeof(base))) {
+    if (!span_readable(display + field, sizeof(base))) {
         return false;
     }
 
-    std::memcpy(base, reinterpret_cast<void const*>(display + kDisplayNameplateBase), sizeof(base));
+    std::memcpy(base, reinterpret_cast<void const*>(display + field), sizeof(base));
     if (!plausible(base)) {
         return false;
     }
@@ -1547,14 +1574,15 @@ bool bone_position(std::uintptr_t display, int bone, Position& out) {
 // feet, not up at its chest.
 bool ground_position(DWORD index, Position const& fallback, Position& out) {
     std::uintptr_t const entity = entity_at(index);
+    std::uintptr_t const field = position_field_for(index);
 
     if (entity != 0) {
         std::uint32_t display = 0;
         if (read_memory(entity + kEntityDisplayPtr, display) && display != 0) {
             float coords[3] {};
-            if (span_readable(display + kDisplayNameplateBase, sizeof(coords))) {
+            if (span_readable(display + field, sizeof(coords))) {
                 std::memcpy(coords,
-                    reinterpret_cast<void const*>(display + kDisplayNameplateBase),
+                    reinterpret_cast<void const*>(display + field),
                     sizeof(coords));
                 if (plausible(coords)) {
                     out.east = coords[0];
@@ -1616,24 +1644,26 @@ bool ring_centre(Ring const& ring, Position& out) {
 // mob whose model has not streamed in still gets a line.
 bool anchor_position(DWORD index, Position const& fallback, Position& out) {
     std::uintptr_t const entity = entity_at(index);
+    std::uintptr_t const field = position_field_for(index);
 
     if (entity != 0) {
         std::uint32_t display = 0;
         if (read_memory(entity + kEntityDisplayPtr, display) && display != 0) {
             if (g_anchor_mode == kAnchorModel
-                && model_position(display, model_fraction_for(index), out)) {
+                && model_position(display, field, model_fraction_for(index), out)) {
                 return true;
             }
 
-            if (g_anchor_mode == kAnchorBone && bone_position(display, g_bone, out)) {
+            if (g_anchor_mode == kAnchorBone
+                && bone_position(display, field, g_bone, out)) {
                 return true;
             }
 
             if (g_anchor_mode != kAnchorEntity) {
                 float coords[3] {};
-                if (span_readable(display + kDisplayNameplateBase, sizeof(coords))) {
+                if (span_readable(display + field, sizeof(coords))) {
                     std::memcpy(coords,
-                        reinterpret_cast<void const*>(display + kDisplayNameplateBase),
+                        reinterpret_cast<void const*>(display + field),
                         sizeof(coords));
                     if (plausible(coords)) {
                         out.east = coords[0];
@@ -2320,8 +2350,9 @@ int __cdecl lua_probe(lua_State* L) {
     bool have_nameplate = false;
     if (display != 0) {
         float coords[3] {};
-        if (span_readable(display + kDisplayNameplateBase, sizeof(coords))) {
-            std::memcpy(coords, reinterpret_cast<void const*>(display + kDisplayNameplateBase),
+        std::uintptr_t const field = position_field_for(index);
+        if (span_readable(display + field, sizeof(coords))) {
+            std::memcpy(coords, reinterpret_cast<void const*>(display + field),
                 sizeof(coords));
             if (plausible(coords)) {
                 nameplate.east = coords[0];
