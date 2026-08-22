@@ -35,6 +35,7 @@ local defaults = {
     -- Lines
     curved = true,
     depth = true,
+    glow = true,   -- white core, versus the colour throughout
     width = 3.00,
     arch = 0.18,
     bow = 11.25,
@@ -58,6 +59,13 @@ local defaults = {
     aoe_orbit = 1.30,
     aoe_tail = 2.60,
     aoe_width = 2.20,
+    -- Fraction of a burst's life spent at full brightness before it
+    -- starts fading. Fading from the instant it appears made the comets
+    -- read as a flicker rather than a mark.
+    aoe_fade = 0.55,
+    -- Incoming area effects draw heavier than your own. Something landing
+    -- on you is worth noticing; your own is confirmation.
+    aoe_enemy_scale = 1.60,
 
     -- Config panel row height and character width, in pixels, used to map
     -- a click back to a row and column. Normally measured from what the
@@ -119,6 +127,7 @@ local spec = {
     {section = 'Lines'},
     {name = 'curved', label = 'Curved Arcs', type = 'toggle'},
     {name = 'depth',  label = 'World Depth', type = 'toggle'},
+    {name = 'glow',   label = 'White Core',  type = 'toggle'},
     {name = 'width',  label = 'Line Width',  type = 'value', step = 0.5,  min = 1,   max = 16},
     {name = 'arch',   label = 'Arc Height',  type = 'value', step = 0.02, min = 0,   max = 2},
     {name = 'bow',       label = 'Arc Lean',      type = 'value', step = 2.5, min = -90, max = 90},
@@ -145,6 +154,8 @@ local spec = {
     {name = 'aoe_orbit',      label = 'Comet Speed',  type = 'value', step = 0.1,  min = 0,   max = 6},
     {name = 'aoe_tail',       label = 'Comet Tail',   type = 'value', step = 0.2,  min = 0.2, max = 6.2},
     {name = 'aoe_width',      label = 'Comet Width',  type = 'value', step = 0.1,  min = 0.2, max = 8},
+    {name = 'aoe_fade',       label = 'Hold Before Fade', type = 'value', step = 0.05, min = 0, max = 1},
+    {name = 'aoe_enemy_scale', label = 'Incoming Weight', type = 'value', step = 0.1, min = 0.5, max = 4},
 }
 
 local by_name = {}

@@ -99,6 +99,8 @@ Nothing goes in the `plugins` folder and there is nothing to configure.
 //tlines aoe orbit <turns/sec>    how fast the comet travels         (1.30)
 //tlines aoe tail <radians>       length of its trail                (2.60)
 //tlines aoe width <n>            comet thickness, x line width      (2.20)
+//tlines aoe fade <0-1>           fraction of life at full brightness(0.55)
+//tlines aoe enemy_scale <n>      how much heavier incoming draws    (1.60)
 ```
 
 **Shape of the arc**
@@ -111,6 +113,7 @@ Nothing goes in the `plugins` folder and there is nothing to configure.
 //tlines width <pixels>           beam thickness                  (default 3)
 //tlines orb <pixels>             travelling dot, 0 disables      (default 22)
 //tlines depth                    world occlusion or always on top (default occluded)
+//tlines glow                     white core, or the colour throughout   (default on)
 ```
 
 **Where lines attach**
@@ -130,6 +133,8 @@ Nothing goes in the `plugins` folder and there is nothing to configure.
 ```
 //tlines probe [index|me]         model height, bone count, 16 bone heights
 //tlines scan                     SceneHook bus: owner, slot, client count
+//tlines perf [reset|on|off]      draw timing, best / avg / worst
+//tlines aoedebug                 report where each area effect centres
 ```
 
 ## The settings panel
@@ -285,10 +290,11 @@ MinGW works too (`-m32`), per the `else()` branch in `src/CMakeLists.txt`.
 - [x] **Stage 4** — auto-attack modes, area-of-effect sweep rings with orbiting
       comets, and role filtering
 - [x] **Stage 5** — settings model, clickable config panel, persistence
-- [~] **Stage 6** — performance. Device vtable pointers and ring trig are
-      cached; still to do: reject off-screen objects before projecting their
-      vertices, scale sample counts with distance, and measure any of it.
-      GPU-side geometry is on hold pending detail from Geno.
+- [x] **Stage 6** — performance. Measured at **0.1 µs** per draw, so the work
+      is free and the GPU conversion is not worth doing. Vtable pointers,
+      ring trig and model height are cached, the skeleton walk is hoisted out
+      of its per-bone loop, off-screen arcs are culled and sample counts
+      follow on-screen length.
 - [x] **Stage 7** — one shared entity classifier, per-role opacity, doors and
       scenery on their own switch, and a separate lean for incoming lines
 

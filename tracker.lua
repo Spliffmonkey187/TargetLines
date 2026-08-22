@@ -275,8 +275,8 @@ local function record_burst(actor, targets, category, colour, now)
     local radius = spread_from(cx, cy, targets)
 
     if burst_report then
-        burst_report(('aoe: %s -> centre %s (%s), radius %.1f, %d targets')
-            :format(tostring(actor.name), tostring(centre.name),
+        burst_report(('aoe: %s [%s] -> centre %s (%s), radius %.1f, %d targets')
+            :format(tostring(actor.name), tostring(colour), tostring(centre.name),
                 reason, radius, #targets))
     end
 

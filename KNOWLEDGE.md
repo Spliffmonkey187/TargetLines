@@ -616,94 +616,105 @@ area-of-effect sweep rings with orbiting comets, and role filtering.
 - Does the AoE centring heuristic get anything visibly wrong?
 - Does anything in TargetRing/GEO-HUD glitch from our texture-stage changes?
 
-**Next:** stage 6 performance -- reject off-screen objects before projecting
-their vertices, scale arc sample counts with distance, and measure the two
-optimisations already made. GPU-side geometry is on hold pending detail from
-Geno. Colour blind mode was dropped by the user as unwanted.
+**Next:** nothing outstanding. The project is at a natural resting point, and
+the sensible move is to wait on the ecosystem -- Nalfey, Broguypal, MogSafe and
+Geno -- rather than invent work. Reading what the neighbours did has solved four
+problems already: SceneHook, the AoE radius inference, the forgiving hit zones,
+and the door position offset.
+
+Still open, but only play will answer them:
+
+- Whether the 13-bone cutoff for model height holds on every skeleton. No prior
+  art to borrow; probe reports the winning bone if a model ever looks wrong.
+- Whether glow should differ between long arcs and small rings (section 10c).
+- Cone-shaped area effects. Neither we nor MogSafe draw them; his "Fan" mode is
+  lines to each target, not a cone. The direction could come from the heading at
+  `display + 0x048`, but the packet never gives the cone angle, so the width
+  would be a guess per move.
 
 ---
 
-## 10b. Stage 6 — performance (planned)
+## 10b. Stage 6 — performance (done, and mostly unnecessary)
 
-Nothing here is measured yet; these are the candidates, cheapest and safest
-first. **Measure before and after** rather than trusting this ordering.
+**Measured result: 0.1 us best, on a frame drawing 24 vertices.** The draw work
+is free. There is nothing left worth optimising and no reason to pursue the GPU
+conversion.
 
-### 1. Cache the device vtable pointers — DONE
+### How the measurement misled me first
 
-Was the biggest easy win, and pure overhead.
+The first readings said **14,000 us average**, which would have been most of a
+frame. I nearly went chasing it. Two things were wrong:
 
-Every `dev_*` wrapper calls `vtable_slot()`, and `vtable_slot()` calls
-`span_readable()` **twice** -- once for the object, once for the vtable entry --
-each of which is a `VirtualQuery`, a kernel transition. There are ~64
-render-state and texture-stage calls in `begin_draw_state` / `end_draw_state`
-alone, so a frame costs well over a hundred `VirtualQuery` calls before any
-geometry is touched.
+1. **Wall-clock timing cannot tell work from waiting.** `QueryPerformanceCounter`
+   measures elapsed time. With the game capped at 30fps the process idles most of
+   each frame, and if the render thread is descheduled mid-draw the gap is
+   counted as our cost.
+2. **I did the arithmetic assuming 60fps** without asking, which doubled the
+   apparent share of frame time.
 
-The device is acquired once and its vtable does not move, so the eleven hot
-pointers are now resolved in `resolve_device_api()` at acquisition and called
-directly. `CreateTexture` still goes the slow way; it runs twice, at load.
+Adding a **minimum** settled it in one reading. Best is the closest thing to
+uninterrupted work; a tiny best beside a huge average means the average is
+scheduling noise. **Always report best/avg/worst, and read best.**
 
-Not yet measured. The reasoning is sound but the size of the win is a guess
-until someone puts a timer on a frame.
+The A/B was also uncontrolled: three runs of the same configuration gave 8.3,
+12.4 and 13.4 ms, a spread far larger than the effect being measured. If the
+variation between identical runs exceeds the difference being tested, the
+experiment says nothing.
 
-### 2. Precompute the ring trig — DONE
+`//tlines perf` reports it; `perf on|off` toggles culling and adaptive sampling
+so they can be measured against themselves.
 
-`build_ring` calls `std::cos` and `std::sin` per vertex, per ring, per frame --
-49 of each per ring. The angles are fixed, so a table built once at load now covers
-every full ring, exactly as TargetRing does. Comets sample an arbitrary arc and
-still compute real trig, but they are short -- roughly twenty segments against
-the ring's forty-eight.
+### What was done anyway, and why it still stands
 
-### 3. Reject whole objects before projecting their vertices
+These reduce work that is *countable* rather than merely measurable, so they are
+defensible regardless of what the timer says:
 
-Projection currently runs per vertex, and an arc off screen still costs 40 full
-matrix multiplies before every sample is discarded. Projecting the two endpoints
-first, and skipping the whole arc when both fail, would cut the common case of a
-busy zone with many distant fights.
+- **Device vtable pointers cached.** Every `dev_*` call resolved through
+  `vtable_slot()`, which runs `span_readable()` twice, each a `VirtualQuery`.
+  About sixty device calls in the draw-state setup meant over a hundred kernel
+  transitions per frame before touching geometry.
+- **Ring trig tabulated.** A full ring always uses the same angles.
+- **Skeleton walk hoisted.** `bone_offset` re-walked the chain from display
+  object to generator array *for every bone* -- five memory probes each, thirteen
+  bones, so ~65 `VirtualQuery` calls per entity per frame, for every line
+  endpoint and every comet target. Now walked once.
+- **Model height cached** per entity for 500ms. It is the skeleton's rest extent,
+  not an animated value, so deriving it sixty times a second was waste.
+- **Off-screen arcs culled** by projecting the two anchors and the apex before
+  building anything, and **sample counts scale with on-screen length** -- a
+  distant arc a few pixels long gets four points rather than forty.
 
-### 4. Scale sample counts with distance
+### The GPU question, closed
 
-40 samples is generous for an arc a few pixels long. Choosing the count from the
-projected screen length would cut most of the vertex work in a crowd, where it
-matters most.
+Not worth doing. The CPU cost it would remove is 0.1 us, and the conversion
+would cost the screen-space line width that keeps a beam the same thickness near
+and far. Section 6 has the detail if it is ever revisited.
 
-### What Geno means by moving work to the GPU
+---
 
-He did not explain it in the Discord, so this is inference -- but there is only
-really one thing it can mean here.
+## 10c. Colour washout on thin geometry
 
-We use `D3DFVF_XYZRHW`: **pre-transformed** vertices. The CPU does the whole
-world to clip to screen transform for every vertex of every arc and ring, every
-frame, and hands the GPU finished screen coordinates. The GPU only rasterises.
+The beam texture is white with an alpha falloff, drawn with
+`D3DTOP_BLENDTEXTUREALPHA`:
 
-The alternative is `D3DFVF_XYZ` -- untransformed vertices with the world, view
-and projection matrices set on the device, so the **GPU** does the transform in
-its fixed-function pipeline. Two gains follow:
+```
+result = texture.rgb x texture.a  +  line_colour x (1 - texture.a)
+```
 
-1. The per-vertex matrix maths leaves the CPU entirely.
-2. Geometry whose *shape* does not change can live in a static vertex buffer
-   created once and positioned by a world matrix per draw. A ring is the perfect
-   case: a unit circle uploaded once, then scaled and translated by a matrix.
-   The per-frame CPU cost drops to a matrix and a draw call, with no vertex data
-   crossing the bus at all.
+Down the middle of a band `texture.a` is near 1, so the centre renders **white**
+and the colour only appears at the soft edges. That is the white-hot core Ashita
+has, and it looks right on a long arc.
 
-**The catch, and why this is not a drop-in change.** Ribbon width is currently
-computed in *screen space*: each sample is projected, then extruded
-perpendicular to the screen-space path by a pixel count. That is what makes a
-line the same thickness near and far. Fixed-function GPU transform cannot do
-that -- thickness would have to be in yalms, so lines would thin with distance.
-Arguably more correct in 3D, but a visible change from Ashita.
+On a **thin ring** almost every visible pixel is core, so the colour barely
+reads -- an enemy ring looked pale rather than red, which is what prompted this.
+Nothing was wrong with the classification: `//tlines aoedebug` confirmed the
+burst was `[enemy]`, so the correct colour was being passed and then washed out
+at the last step.
 
-D3D8 does have vertex shaders (1.1) which could do screen-space width on the
-GPU, but that raises compatibility questions under DXVK and dgVoodoo, which many
-players run.
-
-**A sensible split:** move *rings* to GPU-transformed static geometry first, as
-a circle is fixed geometry and world-space thickness looks fine on a ground
-ring. Keep arcs on the CPU path where screen-space width matters. That captures
-most of the win without changing how the lines look.
-
-Worth asking Geno directly what he did before building any of it.
+`//tlines glow` switches the blend to `MODULATE`, which gives the colour
+throughout with the texture supplying only the edge. **Open question:** the glow
+probably suits long arcs while flat colour suits small rings, in which case the
+two should use different blends rather than sharing one switch.
 
 ---
 

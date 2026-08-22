@@ -58,6 +58,7 @@ local function apply()
     -- a value they set directly, which is what lets Lua stay authoritative.
     _TargetLines.arc(set.curved and 0 or 1)
     _TargetLines.depth(set.depth and 0 or 1)
+    _TargetLines.glow(set.glow and 1 or 0)
 
     tracker.mode(set.attacks)
 end
@@ -228,6 +229,12 @@ local function draw_bursts(now)
             local sweep = math.min(age / AOE_SWEEP, 1)
             local base = COLOURS[burst.colour] or COLOURS.player
 
+            -- Something landing on you is worth noticing; your own is
+            -- confirmation. So incoming bursts draw heavier.
+            local incoming = burst.colour == 'enemy'
+                or burst.colour == 'enemy_friendly'
+            local weight = incoming and (tonumber(set.aoe_enemy_scale) or 1) or 1
+
             -- The front holds full brightness while it travels and only fades
             -- once it has arrived, so the eye follows the expansion outward
             -- rather than watching the whole thing dim.
@@ -242,7 +249,7 @@ local function draw_bursts(now)
                     burst.centre_x, burst.centre_y, burst.centre_z,
                     burst.radius * sweep,
                     colour,
-                    0, set.aoe_lift, 0, 0, set.aoe_sweepwidth)
+                    0, set.aoe_lift, 0, 0, set.aoe_sweepwidth * weight)
             end
 
             -- The head angle advances with time, which is what makes the
@@ -258,13 +265,23 @@ local function draw_bursts(now)
                     local distance = math.sqrt(dx * dx + dy * dy)
 
                     if reached >= distance then
-                        local hit = faded(base, math.max(1 - age / set.aoe_hold, 0))
+                        -- Hold full brightness, then fade. Decaying from
+                        -- the instant it appears made these read as a
+                        -- flicker rather than a mark.
+                        local hold = set.aoe_hold * (tonumber(set.aoe_fade) or 0.55)
+                        local alpha = 1
+                        if age > hold then
+                            alpha = math.max(
+                                1 - (age - hold) / math.max(set.aoe_hold - hold, 0.01), 0)
+                        end
+
+                        local hit = faded(base, alpha)
                         if hit then
                             _TargetLines.ring(target.index,
                                 mob.x or 0, mob.y or 0, mob.z or 0,
                                 set.aoe_radius, hit,
                                 1, set.aoe_chest,
-                                head, set.aoe_tail, set.aoe_width)
+                                head, set.aoe_tail, set.aoe_width * weight)
                         end
                     end
                 end
@@ -549,6 +566,18 @@ windower.register_event('addon command', function(command, ...)
         chat(args[1] and _TargetLines.bones(tonumber(args[1])) or _TargetLines.bones())
     elseif command == 'bone' then
         chat(args[1] and _TargetLines.bone(tonumber(args[1])) or _TargetLines.bone())
+    elseif command == 'perf' then
+        -- //tlines perf          report
+        -- //tlines perf reset    clear the averages
+        -- //tlines perf on|off   culling and adaptive sampling
+        local word = args[1] and args[1]:lower()
+        if word == 'reset' then
+            chat(_TargetLines.perf(-1))
+        elseif word == 'on' or word == 'off' then
+            chat(_TargetLines.perf(word == 'on' and 1 or 0))
+        else
+            chat(_TargetLines.perf())
+        end
     elseif command == 'scan' then
         chat(_TargetLines.scan())
     elseif command == 'probe' then

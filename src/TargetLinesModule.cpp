@@ -269,6 +269,31 @@ float g_ring_clearance = 0.05f;
 
 char g_status[192] = "idle";
 
+// Frame timing for the draw callback.
+//
+// Everything in stage 6 was reasoned about rather than measured, which is a
+// good way to optimise the wrong thing. This times the work we actually do
+// inside draw_scene so a change can be judged instead of assumed.
+LARGE_INTEGER g_perf_frequency {};
+double g_perf_total_us = 0.0;
+double g_perf_worst_us = 0.0;
+double g_perf_best_us = 0.0;
+unsigned g_perf_frames = 0;
+unsigned g_perf_vertices = 0;
+
+// Culling and adaptive sampling, together, so they can be switched off to
+// measure what they are worth.
+bool g_fast = true;
+
+// How the beam texture combines with the line colour.
+//
+//   true   BLENDTEXTUREALPHA -- white down the middle fading out through the
+//          colour, the glow Ashita has. Down a thin ring most visible pixels
+//          are core, so the colour barely reads.
+//   false  MODULATE -- the colour throughout, with the texture supplying only
+//          the soft edge. Truer colour, less glow.
+bool g_white_core = true;
+
 // ---------------------------------------------------------------------------
 // Memory safety
 //
@@ -881,7 +906,8 @@ bool begin_draw_state() {
     // Texture colour blended over the vertex colour by the texture's alpha: a
     // white core that fades outward through the line's own colour. Alpha is
     // multiplied so a line can still be faded as a whole by its vertex alpha.
-    dev_SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_BLENDTEXTUREALPHA);
+    dev_SetTextureStageState(0, D3DTSS_COLOROP,
+        g_white_core ? D3DTOP_BLENDTEXTUREALPHA : D3DTOP_MODULATE);
     dev_SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
     dev_SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
     dev_SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
@@ -1198,7 +1224,7 @@ void rotate_about(float const* k, float const* v, float angle, float* out) {
 // Fill `out` with `count` points along the arc from source to destination.
 // `flip` mirrors the sideways bow for the opposite direction of a pair.
 int build_arc(Position const& source, Position const& destination, float bow,
-    float progress, Position* out, int capacity) {
+    float progress, int samples_wanted, Position* out, int capacity) {
     if (capacity < 2 || progress <= 0.0f) {
         return 0;
     }
@@ -1258,8 +1284,9 @@ int build_arc(Position const& source, Position const& destination, float bow,
     control.height = source.height + rotated[1];
     control.north = source.north + rotated[2];
 
-    int const samples = g_arc_samples < 2 ? 2
-        : (g_arc_samples > capacity ? capacity : g_arc_samples);
+    int const requested = samples_wanted > 0 ? samples_wanted : g_arc_samples;
+    int const samples = requested < 2 ? 2
+        : (requested > capacity ? capacity : requested);
 
     // Walk only as far as `progress`, so the arc reaches out from the actor
     // rather than appearing whole.
@@ -1488,14 +1515,70 @@ bool bone_offset(std::uintptr_t display, int bone, float* local, int* bone_count
 // Heights are negative-up, so the highest bone is the most negative.
 int g_survey_bones = kDefaultSurveyBones;
 
+// Resolve the skeleton once. The chain from display object to generator array
+// is identical for every bone, and bone_offset walked it again for each one --
+// five memory probes per bone where one would do.
+bool skeleton_generators(std::uintptr_t display, std::uintptr_t& generators,
+    int& bone_count) {
+    std::uint32_t skeleton_base = 0;
+    if (!read_memory(display + kDisplaySkeleton, skeleton_base) || skeleton_base == 0) {
+        return false;
+    }
+
+    std::uint32_t skeleton_offset = 0;
+    if (!read_memory(skeleton_base + kSkeletonOffsetField, skeleton_offset)
+        || skeleton_offset == 0) {
+        return false;
+    }
+
+    std::uint32_t skeleton = 0;
+    if (!read_memory(static_cast<std::uintptr_t>(skeleton_offset), skeleton)
+        || skeleton == 0) {
+        return false;
+    }
+
+    std::uint16_t count = 0;
+    if (!read_memory(skeleton + kSkeletonBoneCount, count)) {
+        return false;
+    }
+
+    if (count == 0 || count > 512) {
+        return false;
+    }
+
+    generators = skeleton + kSkeletonBuffer + kSkeletonHeaderSize
+        + kBoneStride * count + 4;
+    bone_count = static_cast<int>(count);
+    return true;
+}
+
 bool model_height(std::uintptr_t display, float& height, int* which) {
+    std::uintptr_t generators = 0;
+    int bone_count = 0;
+    if (!skeleton_generators(display, generators, bone_count)) {
+        return false;
+    }
+
+    int limit = g_survey_bones;
+    if (limit > bone_count) {
+        limit = bone_count;
+    }
+
     float best = 0.0f;
     int best_bone = -1;
 
-    for (int b = 0; b < g_survey_bones; ++b) {
+    for (int b = 0; b < limit; ++b) {
+        std::uintptr_t const origin = generators
+            + static_cast<std::uintptr_t>(b) * kGeneratorStride + kGeneratorOrigin;
+
         float local[3] {};
-        if (!bone_offset(display, b, local, nullptr)) {
+        if (!span_readable(origin, sizeof(float) * 3)) {
             break;
+        }
+
+        std::memcpy(local, reinterpret_cast<void const*>(origin), sizeof(local));
+        if (!plausible(local)) {
+            continue;
         }
 
         if (local[1] < best) {
@@ -1518,9 +1601,48 @@ bool model_height(std::uintptr_t display, float& height, int* which) {
     return true;
 }
 
+// Model height is the skeleton's rest extent, not an animated value, so
+// re-surveying it every frame for every endpoint was most of our per-frame
+// cost. Held briefly per entity instead.
+struct HeightEntry {
+    float top = 0.0f;
+    DWORD stamp = 0;
+    bool valid = false;
+};
+
+HeightEntry g_height_cache[kMaxIndex] {};
+constexpr DWORD kHeightTtlMs = 500;
+
+bool cached_model_height(DWORD index, std::uintptr_t display, float& height) {
+    DWORD const now = GetTickCount();
+
+    if (index < kMaxIndex) {
+        HeightEntry const& entry = g_height_cache[index];
+        if (entry.stamp != 0 && now - entry.stamp < kHeightTtlMs) {
+            height = entry.top;
+            return entry.valid;
+        }
+    }
+
+    float measured = 0.0f;
+    bool const ok = model_height(display, measured, nullptr);
+
+    if (index < kMaxIndex) {
+        g_height_cache[index].top = ok ? measured : 0.0f;
+        g_height_cache[index].stamp = now;
+        g_height_cache[index].valid = ok;
+    }
+
+    if (ok) {
+        height = measured;
+    }
+
+    return ok;
+}
+
 // Attach at a fraction of the model's own height, so the line meets a hare and
 // a dragon at the same point on the body without per-model tuning.
-bool model_position(std::uintptr_t display, std::uintptr_t field,
+bool model_position(DWORD index, std::uintptr_t display, std::uintptr_t field,
     float fraction, Position& out) {
     float base[3] {};
     if (!span_readable(display + field, sizeof(base))) {
@@ -1533,7 +1655,7 @@ bool model_position(std::uintptr_t display, std::uintptr_t field,
     }
 
     float top = 0.0f;
-    if (!model_height(display, top, nullptr)) {
+    if (!cached_model_height(index, display, top)) {
         return false;
     }
 
@@ -1628,7 +1750,7 @@ bool ring_centre(Ring const& ring, Position& out) {
         std::uint32_t display = 0;
         float top = 0.0f;
         if (entity != 0 && read_memory(entity + kEntityDisplayPtr, display)
-            && display != 0 && model_height(display, top, nullptr)) {
+            && display != 0 && cached_model_height(ring.index, display, top)) {
             // Heights are negative-up, so a fraction of `top` raises it.
             out.height += top * ring.amount;
             return true;
@@ -1655,7 +1777,8 @@ bool anchor_position(DWORD index, Position const& fallback, Position& out) {
         std::uint32_t display = 0;
         if (read_memory(entity + kEntityDisplayPtr, display) && display != 0) {
             if (g_anchor_mode == kAnchorModel
-                && model_position(display, field, model_fraction_for(index), out)) {
+                && model_position(index, display, field,
+                    model_fraction_for(index), out)) {
                 return true;
             }
 
@@ -1807,8 +1930,37 @@ void draw_all_lines() {
             bow = -bow;
         }
 
+        int samples = 0;
+        if (g_fast) {
+            // Project the two anchors and the apex before building anything.
+            // An arc entirely off screen used to cost forty Bezier samples and
+            // forty projections before every one of them was discarded.
+            Position const apex = bezier_sample(from, from, to, 0.5f);
+
+            float ax, ay, az, aw, bx, by, bz, bw, mx, my, mz, mw;
+            bool const a_ok = world_to_screen(from, viewport, ax, ay, az, aw);
+            bool const b_ok = world_to_screen(to, viewport, bx, by, bz, bw);
+            bool const m_ok = world_to_screen(apex, viewport, mx, my, mz, mw);
+
+            if (!a_ok && !b_ok && !m_ok) {
+                continue;
+            }
+
+            // Sample density follows the length on screen, not in the world: a
+            // distant arc a few pixels long does not need forty points.
+            if (a_ok && b_ok) {
+                float const dx = bx - ax;
+                float const dy = by - ay;
+                float const length = std::sqrt(dx * dx + dy * dy);
+                samples = static_cast<int>(length / 10.0f) + 4;
+                if (samples > g_arc_samples) {
+                    samples = g_arc_samples;
+                }
+            }
+        }
+
         Position path[kMaxRibbonPoints] {};
-        int const points = build_arc(from, to, bow, line.progress,
+        int const points = build_arc(from, to, bow, line.progress, samples,
             path, kMaxRibbonPoints);
         emit_ribbon(path, points, line.color, viewport);
 
@@ -1826,6 +1978,7 @@ void draw_all_lines() {
         emit_orb(pending[i].at, pending[i].color, viewport);
     }
 
+    g_perf_vertices = static_cast<unsigned>(batch_vertex_count_);
     flush_batch();
     end_draw_state();
 }
@@ -1948,7 +2101,30 @@ void SCENEHOOK_ALIGN_STACK __cdecl scene_draw(void* user, void* renderer, void* 
     g_renderer = reinterpret_cast<std::uintptr_t>(renderer);
 
     acquire_device(g_renderer);
+
+    if (g_perf_frequency.QuadPart == 0) {
+        QueryPerformanceFrequency(&g_perf_frequency);
+    }
+
+    LARGE_INTEGER start {};
+    QueryPerformanceCounter(&start);
+
     draw_all_lines();
+
+    LARGE_INTEGER finish {};
+    QueryPerformanceCounter(&finish);
+    if (g_perf_frequency.QuadPart > 0) {
+        double const us = static_cast<double>(finish.QuadPart - start.QuadPart)
+            * 1000000.0 / static_cast<double>(g_perf_frequency.QuadPart);
+        g_perf_total_us += us;
+        if (us > g_perf_worst_us) {
+            g_perf_worst_us = us;
+        }
+        if (g_perf_best_us == 0.0 || us < g_perf_best_us) {
+            g_perf_best_us = us;
+        }
+        ++g_perf_frames;
+    }
 }
 
 // Join the bus and start drawing. Safe to call repeatedly: once we hold a slot
@@ -2465,6 +2641,55 @@ int __cdecl lua_scan(lua_State* L) {
     return 1;
 }
 
+// Frame timing for the draw callback, and the switch for the two optimisations
+// so they can be measured against themselves.
+int __cdecl lua_glow(lua_State* L) {
+    if (g_lua.gettop(L) >= 1) {
+        g_white_core = g_lua.tonumber(L, 1) != 0.0;
+    } else {
+        g_white_core = !g_white_core;
+    }
+
+    g_lua.pushstring(L, g_white_core
+        ? "glow ON: white core fading out through the colour"
+        : "glow OFF: the colour throughout, soft edges only");
+    return 1;
+}
+
+int __cdecl lua_perf(lua_State* L) {
+    char report[256] {};
+
+    if (g_lua.gettop(L) >= 1) {
+        double const mode = g_lua.tonumber(L, 1);
+        if (mode < 0.0) {
+            g_perf_total_us = 0.0;
+            g_perf_worst_us = 0.0;
+            g_perf_best_us = 0.0;
+            g_perf_frames = 0;
+            std::snprintf(report, sizeof(report), "perf: reset");
+            g_lua.pushstring(L, report);
+            return 1;
+        }
+
+        g_fast = mode != 0.0;
+    }
+
+    if (g_perf_frames == 0) {
+        std::snprintf(report, sizeof(report),
+            "perf: no frames yet, culling %s", g_fast ? "on" : "off");
+        g_lua.pushstring(L, report);
+        return 1;
+    }
+
+    std::snprintf(report, sizeof(report),
+        "perf: %.1f best / %.1f avg / %.1f worst us over %u frames | %u verts, "
+        "%d line(s), %d ring(s), culling %s",
+        g_perf_best_us, g_perf_total_us / g_perf_frames, g_perf_worst_us, g_perf_frames,
+        g_perf_vertices, g_line_count, g_ring_count, g_fast ? "on" : "off");
+    g_lua.pushstring(L, report);
+    return 1;
+}
+
 int __cdecl lua_status(lua_State* L) {
     char report[320] {};
 
@@ -2571,6 +2796,12 @@ extern "C" __declspec(dllexport) int __cdecl luaopen__TargetLines(lua_State* L) 
 
     g_lua.pushcclosure(L, lua_scan, 0);
     g_lua.setfield(L, -2, "scan");
+
+    g_lua.pushcclosure(L, lua_perf, 0);
+    g_lua.setfield(L, -2, "perf");
+
+    g_lua.pushcclosure(L, lua_glow, 0);
+    g_lua.setfield(L, -2, "glow");
 
     g_lua.pushcclosure(L, lua_release, 0);
     g_lua.setfield(L, -2, "release");
