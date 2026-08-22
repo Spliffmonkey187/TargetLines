@@ -108,6 +108,11 @@ struct Line {
     // How much of the arc to draw, 0..1, measured from the actor. Ashita grows
     // the line out to its target and retracts it as the action expires.
     float progress = 1.0f;
+    // Sideways lean for this line, in radians. Held per line so incoming
+    // and outgoing arcs can lean by different amounts; zero means fall
+    // back to the global setting.
+    float bow = 0.0f;
+
     // Retracting: the arc is drawn from the target back towards the actor.
     bool reverse = false;
     bool active = false;
@@ -1192,7 +1197,7 @@ void rotate_about(float const* k, float const* v, float angle, float* out) {
 
 // Fill `out` with `count` points along the arc from source to destination.
 // `flip` mirrors the sideways bow for the opposite direction of a pair.
-int build_arc(Position const& source, Position const& destination, bool flip,
+int build_arc(Position const& source, Position const& destination, float bow,
     float progress, Position* out, int capacity) {
     if (capacity < 2 || progress <= 0.0f) {
         return 0;
@@ -1247,7 +1252,7 @@ int build_arc(Position const& source, Position const& destination, bool flip,
     };
 
     float rotated[3] {};
-    rotate_about(axis, offset, flip ? g_arc_bow : -g_arc_bow, rotated);
+    rotate_about(axis, offset, bow, rotated);
 
     control.east = source.east + rotated[0];
     control.height = source.height + rotated[1];
@@ -1787,21 +1792,23 @@ void draw_all_lines() {
         // Flipping the angle by index as well would negate that a second time
         // and put both arcs back on the same side, which is precisely how they
         // came to overlap. The angle is therefore constant here.
-        bool flip = false;
+        // Zero means the line did not ask for a lean of its own.
+        float bow = line.bow != 0.0f ? line.bow : g_arc_bow;
 
         // A retracting arc is built from the target end. That reverses the
-        // axis for a line that should not move, so here the sign *is* flipped
-        // to cancel it out and hold the curve exactly where it was.
+        // axis for a line that should not move, so the sign is flipped to
+        // cancel it out and hold the curve exactly where it was.
         Position from = source;
         Position to = destination;
         if (line.reverse) {
             from = destination;
             to = source;
-            flip = !flip;
+        } else {
+            bow = -bow;
         }
 
         Position path[kMaxRibbonPoints] {};
-        int const points = build_arc(from, to, flip, line.progress,
+        int const points = build_arc(from, to, bow, line.progress,
             path, kMaxRibbonPoints);
         emit_ribbon(path, points, line.color, viewport);
 
@@ -2112,6 +2119,8 @@ int __cdecl lua_add(lua_State* L) {
     line.color = static_cast<DWORD>(g_lua.tonumber(L, 9));
     line.progress = argc >= 10 ? static_cast<float>(g_lua.tonumber(L, 10)) : 1.0f;
     line.reverse = argc >= 11 && g_lua.tonumber(L, 11) != 0.0;
+    line.bow = argc >= 12
+        ? static_cast<float>(g_lua.tonumber(L, 12)) * 0.01745329252f : 0.0f;
     line.active = true;
 
     g_lines[slot] = line;

@@ -383,21 +383,55 @@ Ring thickness is a **multiplier on the line width**, held separately for comets
 (2.2) and the sweep ring (1.3). At 1.0 the comet tail is under a pixel and
 disappears, which is why the defaults are well above 1.
 
-### Role filtering
+### Roles — one classifier, three consumers
 
-`//tlines show <role>` gates lines *and* rings by what kind of entity is
-involved: `me`, `party`, `trust`, `pet`, `alliance`, `others`, `enemy`. **Both**
-ends of a line must be shown, so hiding trusts also hides lines drawn onto one.
+`role_of()` lives in **tracker.lua** and is the single source of truth. Line
+colour, visibility and opacity all ask it, so an entity cannot be filtered one
+way and coloured another.
 
-Trusts are `is_npc` **and** `in_party`, which distinguishes them from both mobs
-and real party members. Pets are `charmed` or have a `pet_owner_id`, and are
-never enemies since they fight for someone.
+| role | test |
+|---|---|
+| `me` | index matches the player, told to the tracker each frame |
+| `pet` | `charmed`, or has a `pet_owner_id` — fights for someone, never hostile |
+| `trust` | `is_npc` **and** `in_party` |
+| `party` | `in_party` |
+| `alliance` | `in_alliance` |
+| `enemy` | `is_npc` and `spawn_type == 16` (Ashita's `0x10` bit) |
+| `object` | any other `is_npc` — doors, shopkeepers, scenery |
+| `others` | anything else: a player outside your party and alliance |
 
-**Uncertain:** pet/trust detection. Ashita reads spawn flag `0x100`; Windower
-doesn't expose that bit, so we use `charmed` and `pet_owner_id`. A trust or
-avatar attacking a mob **should draw blue, not red** — needs verifying in game.
+`//tlines show <role>` gates lines *and* rings. **Both** ends of a line must be
+shown, so hiding trusts also hides lines drawn onto one.
 
----
+Opacity is grouped more coarsely — `opacity_me`, `opacity_ally`,
+`opacity_enemy` — because in practice you want your own lines readable,
+everyone else's quieter, and incoming attacks somewhere between. It is applied
+by whichever entity is *acting*.
+
+#### Two lessons from unifying these
+
+**Merging functions merges their consequences.** The old tracker used a
+`spawn_type == 16` test purely to pick a **colour**, where being wrong meant a
+wrong-coloured line. The addon separately treated *any* npc as hostile for
+**visibility**. Unifying on the stricter test silently applied it to visibility
+too, so scenery stopped being `enemy` and fell into a category the player had
+switched off -- and lines to doors vanished entirely. The duplication was not
+the danger; the differing *tolerance for being wrong* was.
+
+**`object` exists because `others` was two things.** Scenery and other players
+were one category, so switching off other players also hid every door and
+shopkeeper. Any catch-all category that mixes things a user would toggle
+separately is a bug waiting to be reported.
+
+### Arc lean is per line
+
+`bow` (outgoing) and `bow_enemy` (incoming) are separate, passed to the module
+per line rather than read from one global.
+
+They control **how far** each arc leans, not which side it picks. A→B and B→A
+have opposite axes, so the same angle already swings them apart -- see the
+Rodrigues note in section 6. Setting either to zero makes that direction
+straight while the other still curves.
 
 ## 7b. Settings and the config panel
 
@@ -572,15 +606,20 @@ area-of-effect sweep rings with orbiting comets, and role filtering.
 
 **Open questions:**
 - Is a 13-bone cutoff right for all skeletons? Percentile fallback if not.
-- Do trusts/avatars/pets colour correctly? The role filter now classifies them,
-  but the *line colour* still comes from the older `classify()` in tracker.lua,
-  which uses a cruder test. These two should probably be unified.
+  No prior art to borrow: TargetRing and GEO-HUD only need a ground ring, so
+  neither computes a model height. TargetRing does use `mob.model_size` and
+  `mob.model_scale` from Lua for its footprint radius, and notes that
+  `model_size` reads 0 for most green NPCs -- worth knowing if a height ever
+  needs a cross-check.
+- ~~Do trusts, avatars and pets colour correctly?~~ **Closed.** One shared
+  classifier now feeds colour, visibility and opacity; see section 7.
 - Does the AoE centring heuristic get anything visibly wrong?
 - Does anything in TargetRing/GEO-HUD glitch from our texture-stage changes?
 
-**Next:** the settings UI and persistence (MogSafe items 4 and 6), which would
-also give the growing pile of `//tlines` settings somewhere to live. Per-role
-opacity after that.
+**Next:** stage 6 performance -- reject off-screen objects before projecting
+their vertices, scale arc sample counts with distance, and measure the two
+optimisations already made. GPU-side geometry is on hold pending detail from
+Geno. Colour blind mode was dropped by the user as unwanted.
 
 ---
 

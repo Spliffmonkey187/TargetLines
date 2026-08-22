@@ -28,9 +28,6 @@ local COLOURS = {
     enemy_friendly = 0xFFFF8800,   -- a monster buffing another monster
 }
 
--- Our own entity index, refreshed every frame because it changes on a zone.
-local player_index = 0
-
 -- Seconds for an area-of-effect wavefront to reach its full radius.
 local AOE_SWEEP = 0.45
 
@@ -78,42 +75,47 @@ local function mob_by_index(index)
     return mob
 end
 
--- Which kind of entity this is, for the Show filters.
-local ROLE_ORDER = {'me', 'party', 'trust', 'pet', 'alliance', 'others', 'enemy'}
+-- Roles come from the tracker, which is the single source of truth: the same
+-- answer drives line colour, visibility and opacity. Keeping a second copy here
+-- is what let a trust be filtered one way and coloured another.
+local ROLE_ORDER = {'me', 'party', 'trust', 'pet', 'alliance', 'others', 'object', 'enemy'}
 
-local function role_of(mob)
-    if not mob then
+local function show_entity(mob)
+    local role = tracker.role_of(mob)
+    return role == nil or set['show_' .. role] ~= false
+end
+
+-- Opacity is grouped more coarsely than visibility: three dials rather than
+-- seven, because in practice you want your own lines readable, everyone else's
+-- quieter, and incoming attacks somewhere between.
+local OPACITY_GROUP = {
+    me = 'opacity_me',
+    party = 'opacity_ally',
+    trust = 'opacity_ally',
+    pet = 'opacity_ally',
+    alliance = 'opacity_ally',
+    others = 'opacity_ally',
+    object = 'opacity_ally',
+    enemy = 'opacity_enemy',
+}
+
+local function opacity_for(mob)
+    local key = OPACITY_GROUP[tracker.role_of(mob)]
+    return key and tonumber(set[key]) or 1
+end
+
+-- Fade an ARGB colour by a 0..1 factor.
+local function faded(colour, alpha)
+    if alpha <= 0 then
         return nil
     end
 
-    if player_index ~= 0 and mob.index == player_index then
-        return 'me'
+    local a = math.floor(((colour / 0x1000000) % 0x100) * math.min(alpha, 1))
+    if a < 1 then
+        return nil
     end
 
-    -- Charmed pets and avatars fight for someone, so they are never enemies.
-    if mob.charmed or (mob.pet_owner_id and mob.pet_owner_id ~= 0) then
-        return 'pet'
-    end
-
-    if mob.in_party then
-        -- Trusts are npcs that are nonetheless party members.
-        return mob.is_npc and 'trust' or 'party'
-    end
-
-    if mob.in_alliance then
-        return 'alliance'
-    end
-
-    if mob.is_npc then
-        return 'enemy'
-    end
-
-    return 'others'
-end
-
-local function show_entity(mob)
-    local role = role_of(mob)
-    return role == nil or set['show_' .. role] ~= false
+    return (a * 0x1000000) + (colour % 0x1000000)
 end
 
 -- The index is what lets the module read the live render position; the
@@ -131,12 +133,26 @@ local function submit(src_index, dst_index, colour, progress, reverse)
         return
     end
 
+    -- Faded by whichever end is doing the acting, so incoming attacks can
+    -- be quieted without dimming your own lines.
+    local tint = faded(COLOURS[colour] or COLOURS.player, opacity_for(src))
+    if not tint then
+        return
+    end
+
+    -- Incoming lines get their own lean. The two still swing to opposite
+    -- sides on their own, because the axes are opposite; this only sets
+    -- how far each one goes.
+    local incoming = colour == 'enemy' or colour == 'enemy_friendly'
+    local lean = incoming and set.bow_enemy or set.bow
+
     _TargetLines.add(
         src_index, src.x or 0, src.y or 0, src.z or 0,
         dst_index, dst.x or 0, dst.y or 0, dst.z or 0,
-        COLOURS[colour] or COLOURS.player,
+        tint,
         progress,
-        reverse and 1 or 0)
+        reverse and 1 or 0,
+        lean)
 end
 
 -- The set of entity indices the party filter cares about: party or alliance
@@ -192,20 +208,6 @@ local function phase(arc, now)
     end
 
     return math.min(1 - (0.5 - math.min(age, 1)) * 2, 1), false
-end
-
--- Fade an ARGB colour by a 0..1 factor.
-local function faded(colour, alpha)
-    if alpha <= 0 then
-        return nil
-    end
-
-    local a = math.floor(((colour / 0x1000000) % 0x100) * math.min(alpha, 1))
-    if a < 1 then
-        return nil
-    end
-
-    return (a * 0x1000000) + (colour % 0x1000000)
 end
 
 -- Area-of-effect bursts.
@@ -319,8 +321,9 @@ windower.register_event('prerender', function()
     -- everyone else at either end of a line. Refreshed every frame because the
     -- index changes on a zone.
     local self_mob = windower.ffxi.get_mob_by_target('me')
-    player_index = self_mob and self_mob.index or 0
-    _TargetLines.player(player_index)
+    local self_index = self_mob and self_mob.index or 0
+    tracker.set_player(self_index)
+    _TargetLines.player(self_index)
 
     local now = os.clock()
     local wanted = set.filter ~= 'all' and relevant_indices() or nil
@@ -559,6 +562,23 @@ windower.register_event('addon command', function(command, ...)
             chat('probe: target something, or pass an index, or "me"')
         else
             chat(_TargetLines.probe(index))
+
+            -- How this entity is classified, and whether that is why it
+            -- is or is not drawing. Guessing at spawn_type is what made
+            -- lines vanish once the classifier got stricter.
+            local mob = mob_by_index(index)
+            if mob then
+                local role = tracker.role_of(mob)
+                chat(('role %s, shown %s | npc %s, spawn_type %s, party %s, '
+                    .. 'alliance %s, charmed %s')
+                    :format(tostring(role),
+                        tostring(show_entity(mob)),
+                        tostring(mob.is_npc),
+                        tostring(mob.spawn_type),
+                        tostring(mob.in_party),
+                        tostring(mob.in_alliance),
+                        tostring(mob.charmed)))
+            end
         end
     elseif command == 'help' then
         chat('//tlines config            open the settings panel')

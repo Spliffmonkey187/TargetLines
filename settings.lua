@@ -22,7 +22,15 @@ local defaults = {
     show_pet = true,
     show_alliance = true,
     show_others = true,
+    show_object = true,   -- doors, shopkeepers, scenery
     show_enemy = true,
+
+    -- Opacity, grouped more coarsely than visibility: three dials rather
+    -- than seven, because in practice you want your own lines readable,
+    -- everyone else's quieter, and incoming attacks somewhere between.
+    opacity_me = 1.00,
+    opacity_ally = 0.75,
+    opacity_enemy = 0.85,
 
     -- Lines
     curved = true,
@@ -30,6 +38,9 @@ local defaults = {
     width = 3.00,
     arch = 0.18,
     bow = 11.25,
+    -- Incoming lines lean by their own amount, so a fight can be widened
+    -- without making your own arcs look thrown.
+    bow_enemy = 11.25,
     orb = 22,
 
     -- Where lines attach
@@ -102,6 +113,7 @@ local spec = {
     {name = 'show_pet',      label = 'Pets',          type = 'toggle'},
     {name = 'show_alliance', label = 'Alliance',      type = 'toggle'},
     {name = 'show_others',   label = 'Other Players', type = 'toggle'},
+    {name = 'show_object',   label = 'Doors & NPCs',  type = 'toggle'},
     {name = 'show_enemy',    label = 'Enemies',       type = 'toggle'},
 
     {section = 'Lines'},
@@ -109,8 +121,14 @@ local spec = {
     {name = 'depth',  label = 'World Depth', type = 'toggle'},
     {name = 'width',  label = 'Line Width',  type = 'value', step = 0.5,  min = 1,   max = 16},
     {name = 'arch',   label = 'Arc Height',  type = 'value', step = 0.02, min = 0,   max = 2},
-    {name = 'bow',    label = 'Arc Lean',    type = 'value', step = 2.5,  min = -90, max = 90},
+    {name = 'bow',       label = 'Arc Lean',      type = 'value', step = 2.5, min = -90, max = 90},
+    {name = 'bow_enemy', label = 'Arc Lean In',   type = 'value', step = 2.5, min = -90, max = 90},
     {name = 'orb',    label = 'Orb Size',    type = 'value', step = 2,    min = 0,   max = 64},
+
+    {section = 'Opacity'},
+    {name = 'opacity_me',    label = 'Mine',     type = 'value', step = 0.05, min = 0.05, max = 1},
+    {name = 'opacity_ally',  label = 'Allies',   type = 'value', step = 0.05, min = 0.05, max = 1},
+    {name = 'opacity_enemy', label = 'Enemies',  type = 'value', step = 0.05, min = 0.05, max = 1},
 
     {section = 'Attach Height'},
     {name = 'chest_me',     label = 'On Me',      type = 'value', step = 0.05, min = 0, max = 1},

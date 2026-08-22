@@ -81,7 +81,8 @@ Nothing goes in the `plugins` folder and there is nothing to configure.
 //tlines filter <mode>            all | alliance | party          (default all)
 //tlines attacks <mode>           first | repeat | off            (default first)
 //tlines target                   toggle the always-on line to your target
-//tlines show <role> [on|off]     me party trust pet alliance others enemy
+//tlines show <role> [on|off]     me party trust pet alliance others
+                                 object enemy
 //tlines show all | none          every role at once
 //tlines show                     list what is currently shown
 ```
@@ -105,7 +106,8 @@ Nothing goes in the `plugins` folder and there is nothing to configure.
 ```
 //tlines arc                      curved or straight              (default curved)
 //tlines arch <0-2>               rise as a fraction of distance  (default 0.18)
-//tlines bow <degrees>            sideways lean                   (default 11.25)
+//tlines bow <degrees>            lean of your outgoing lines     (default 11.25)
+//tlines bow_enemy <degrees>      lean of incoming attack lines   (default 11.25)
 //tlines width <pixels>           beam thickness                  (default 3)
 //tlines orb <pixels>             travelling dot, 0 disables      (default 22)
 //tlines depth                    world occlusion or always on top (default occluded)
@@ -287,7 +289,8 @@ MinGW works too (`-m32`), per the `else()` branch in `src/CMakeLists.txt`.
       cached; still to do: reject off-screen objects before projecting their
       vertices, scale sample counts with distance, and measure any of it.
       GPU-side geometry is on hold pending detail from Geno.
-- [ ] per-role opacity, colour blind mode
+- [x] **Stage 7** — one shared entity classifier, per-role opacity, doors and
+      scenery on their own switch, and a separate lean for incoming lines
 
 Engineering detail — verified memory offsets, the bone data behind the anchoring
 design, rendering internals and the gotchas — is in

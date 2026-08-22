@@ -70,10 +70,6 @@ local DEATH_MESSAGES = {
     [406] = true, [605] = true, [646] = true,
 }
 
--- Windower's spawn_type for a monster. Ashita tests spawn flag 0x10, which is
--- the same bit.
-local SPAWN_MOB = 16
-
 local function mob_by_id(id)
     if not id or id == 0 then
         return nil
@@ -87,42 +83,76 @@ local function mob_by_id(id)
     return mob
 end
 
--- A monster, as opposed to a player, trust, NPC or a charmed pet fighting for
--- someone. Party and alliance members are never monsters even when charmed.
-local function is_mob(mob)
-    if not mob or not mob.is_npc then
-        return false
-    end
+-- Which kind of entity this is. The single source of truth: line colour,
+-- visibility and opacity all ask this, so a trust cannot be filtered one way
+-- and coloured another.
+--
+--   me        the player
+--   party     a party member
+--   trust     an npc that is nonetheless a party member
+--   pet       charmed, or owned by someone
+--   alliance  an alliance member outside the party
+--   others    a player outside the party and alliance
+--   object    scenery, doors, shopkeepers -- anything npc that is not a
+--             monster. Kept apart from `others` because hiding other
+--             players should not also hide the door in front of you.
+--   enemy     a monster
+local SPAWN_MOB = 16
+local player_index = 0
 
-    if mob.in_party or mob.in_alliance then
-        return false
-    end
-
-    return (tonumber(mob.spawn_type) or 0) == SPAWN_MOB
-end
-
--- Pets act on their owner's behalf, so a pet attacking a monster should draw a
--- player-coloured line rather than a monster-coloured one. Windower exposes
--- charm state directly; avatars and wyverns are npcs owned by a party member.
-local function is_pet(mob)
+local function role_of(mob)
     if not mob then
-        return false
+        return nil
     end
 
-    return mob.charmed == true or (mob.pet_owner_id ~= nil and mob.pet_owner_id ~= 0)
+    if player_index ~= 0 and mob.index == player_index then
+        return 'me'
+    end
+
+    -- Charmed pets and avatars fight for someone, so they are never enemies.
+    if mob.charmed or (mob.pet_owner_id and mob.pet_owner_id ~= 0) then
+        return 'pet'
+    end
+
+    if mob.in_party then
+        return mob.is_npc and 'trust' or 'party'
+    end
+
+    if mob.in_alliance then
+        return 'alliance'
+    end
+
+    -- spawn_type 16 is the monster flag, the same bit Ashita tests as 0x10.
+    if mob.is_npc and (tonumber(mob.spawn_type) or 0) == SPAWN_MOB then
+        return 'enemy'
+    end
+
+    -- Anything else npc-flagged is scenery, a door or a shopkeeper.
+    -- Neutral rather than hostile, so a line to a door is not coloured as
+    -- an attack, and on its own switch so it is not hidden along with
+    -- other players.
+    if mob.is_npc then
+        return 'object'
+    end
+
+    return 'others'
 end
 
--- Ashita's colour rules, unchanged:
+local function hostile(role)
+    return role == 'enemy'
+end
+
+-- Ashita's colour rules, expressed against the shared roles:
 --   monster -> monster   enemy_friendly   (a mob healing or buffing a mob)
 --   monster -> anyone    enemy            (a mob attacking you)
 --   anyone  -> monster   player           (you attacking a mob)
 --   anyone  -> anyone    player_friendly  (a cure, a buff)
 local function classify(actor, target)
-    if is_mob(actor) and not is_pet(actor) then
-        return is_mob(target) and 'enemy_friendly' or 'enemy'
+    if hostile(role_of(actor)) then
+        return hostile(role_of(target)) and 'enemy_friendly' or 'enemy'
     end
 
-    return is_mob(target) and 'player' or 'player_friendly'
+    return hostile(role_of(target)) and 'player' or 'player_friendly'
 end
 
 -- Whether a regular attack from this actor onto this target should draw.
@@ -363,6 +393,12 @@ end)
 return {
     arcs = arcs,
     bursts = bursts,
+    role_of = role_of,
+
+    -- Told every frame, because the index changes on a zone.
+    set_player = function(index)
+        player_index = tonumber(index) or 0
+    end,
     burst_life = BURST_LIFE,
     timeouts = TIMEOUTS,
     forget = forget,
